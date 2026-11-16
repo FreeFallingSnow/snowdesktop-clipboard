@@ -70,6 +70,8 @@ snowwidget preview . preview.png --columns 3 --rows 3 --canvas-size 512 --paddin
 snowwidget quality .
 snowwidget pack    . clipboard.snowwidget
 snowwidget validate clipboard.snowwidget
+# 重新编译原生助手（Windows .NET Framework csc）：
+csc /target:exe /optimize+ /out:bin/clipwatch.exe src/clipwatch/ClipWatch.cs /reference:System.dll /reference:System.Drawing.dll
 ```
 
 ### 结构
@@ -80,6 +82,7 @@ modules/clipboard.lua    纯数据模型：历史、筛选、合并、持久化�
 modules/preview.lua      原生缩略图 base64/RGB 解码
 modules/storage.lua      原子存储事务
 bin/clipwatch.exe        C# Win32 常驻监听助手
+src/clipwatch/ClipWatch.cs  助手源码
 tests/                   snowwidget 单元测试
 ```
 
