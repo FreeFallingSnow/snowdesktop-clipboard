@@ -1,0 +1,4 @@
+*.snowwidget
+*.snowwidget-export-*
+_old-packages/
+preview-*.png
