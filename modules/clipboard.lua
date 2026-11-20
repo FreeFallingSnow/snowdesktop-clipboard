@@ -195,7 +195,7 @@ function clipboard.copyEntry(item)
     return result
 end
 
--- Native image/file events are new history items, including repeated copies of
+-- Subscription image/file events are new history items, including repeated copies of
 -- the same content. The optional refresh target lets one explicit host read
 -- enrich that exact row without replacing any other same-kind entries.
 function clipboard.enrichSession(list, id, entry)

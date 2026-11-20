@@ -1,17 +1,12 @@
 -- main.lua - Clipboard, a SnowDesktop clipboard-history card.
 --
--- History sources:
---   * a resident native helper (bin/clipwatch.exe) watches text, file names
---     and a small image thumbnail through Win32 and streams native.event
---     frames. A Lua timer cannot read the clipboard: host tasks require a
---     trusted pointer gesture, so the helper is the supported background path.
---   * the + button still reads the clipboard manually and works without the
---     native permission (and for texts too large for a helper frame).
+-- The clipboard subscription records text, file names and image thumbnails.
+-- The refresh button uses a trusted gesture to read the current clipboard.
 --
 -- Image and file entries are read-only and session-bound: the host returns
--- instance-bound handles/references on a click; the helper's RGB mosaic and
+-- instance-bound handles/references on a click; the RGB thumbnail and
 -- display names are not host handles. Neither kind can be persisted or written
--- back (clipboard.write accepts text only).
+-- back by this widget.
 
 local clipboard = module.require("modules/clipboard.lua")
 local historyStorage = module.require("modules/storage.lua")
@@ -23,7 +18,6 @@ local TOAST_MS = 2800
 local CONFIRM_MS = 3000
 local MAX_TEXT = clipboard.MAX_TEXT
 local MAX_STORED_TEXT = clipboard.MAX_STORED_TEXT
-local WATCH_HELPER = "clipwatch"
 local TOOLTIPS = widget.hasFeature("interaction.tooltip")
 local SEMANTIC_METADATA = widget.hasFeature("interaction.accessibility.metadata")
 local SEARCH_INPUT = widget.hasFeature("control.textInput")
@@ -146,14 +140,23 @@ end
 
 -- contentTheme is the resolved foreground, not a guess based on wallpaper or
 -- background RGB: 1 = dark ink, 0 = light ink. All card fills derive from it.
+local function foregroundColor(color, lightTheme)
+    if not lightTheme then return color end
+    local r = math.floor(math.floor(color / 65536) % 256 * 0.57)
+    local g = math.floor(math.floor(color / 256) % 256 * 0.57)
+    local b = math.floor((color % 256) * 0.57)
+    return r * 65536 + g * 256 + b
+end
+
 local function palette(snapshot)
     local light = snapshot.contentTheme == 1
-    local accent = snapshot.accentColor or ACCENT
+    local accent = foregroundColor(snapshot.accentColor or ACCENT, light)
     -- Keep the filter readable on system accent colors with a light foreground.
     local brightness = (math.floor(accent / 65536) % 256) * 0.299
         + (math.floor(accent / 256) % 256) * 0.587 + (accent % 256) * 0.114
     return {
         ink = light and 0x25252B or 0xF5F6F8,
+        muted = light and 0x575962 or 0xB7B9C3,
         surface = light and 0xFFFFFF or 0x0A0A0D,
         accent = accent,
         accentInk = brightness > 165 and 0x1C1C1E or 0xFFFFFF,
@@ -392,44 +395,37 @@ storageError = function(model, err)
     widget.log("warn", "clipboard: " .. message)
 end
 
--- Native clipboard watcher -------------------------------------------------
-
-local scheduleWatchRetry  -- defined below; retries helper startup with backoff
-local WATCH_RETRY_MAX = 5
+-- Clipboard subscription ---------------------------------------------------
 
 local function startWatch(model)
-    if model.watchId or not model.cfg.autoWatch then return end
-    if model.preview or not widget.hasFeature("task.native.watch") then return end
-    local taskId, err = task.start("native.watch", {
-        helper = WATCH_HELPER,
-        operation = "watch",
-        payload = "{}",
-        timeoutMs = 6000,
-    })
-    if taskId then
-        model.watchId = taskId
-        model.watchError = nil
-        model.watchAttempts = 0
-    else
-        model.watchError = tostring(err)
-        scheduleWatchRetry(model)
+    if model.watch or model.preview or not model.cfg.autoWatch then return end
+    if not widget.hasPermission("clipboard.observe") then
+        model.watchError = "permissionDenied"
+        return
     end
+    local ok, subscription = pcall(function()
+        return data.subscribe("clipboard.changes")
+    end)
+    if not ok then
+        model.watchError = "subscriptionUnavailable"
+        return
+    end
+    local status = subscription:value()
+    if status.available then
+        model.watch = subscription
+        model.watchError = nil
+        return
+    end
+    model.watchError = status.error or "subscriptionUnavailable"
+    subscription:unsubscribe()
 end
 
 local function stopWatch(model)
-    if not model.watchId then return end
-    task.cancel(model.watchId)
-    model.watchId = nil
-end
-
--- Exponential backoff for a helper that failed to start or exited; stops
--- after WATCH_RETRY_MAX tries and stays in manual mode until the user acts.
-scheduleWatchRetry = function(model)
-    if model.preview or not model.cfg.autoWatch then return end
-    model.watchAttempts = (model.watchAttempts or 0) + 1
-    if model.watchAttempts > WATCH_RETRY_MAX then return end
-    local delay = math.min(30000, 2000 * (2 ^ (model.watchAttempts - 1)))
-    schedule.after("watchRetry", math.floor(delay + 0.5))
+    if model.watch then model.watch:unsubscribe() end
+    model.watch = nil
+    model.watchError = nil
+    model.watchKind = nil
+    model.watchEntryId = nil
 end
 
 -- Clipboard tasks ----------------------------------------------------------
@@ -473,9 +469,7 @@ local function readClipboard(model, format, batch, refreshId)
     widget.invalidate()
 end
 
--- A scheduled callback is NOT a trusted gesture. Read the type just observed
--- by the watcher in one host task; without the helper, explicit type actions
--- remain available in the refresh button's context menu.
+-- Read the last observed format or the explicit choice in the refresh menu.
 refreshClipboard = function(model, preferred)
     if model.captureActive or hasPending(model, "read") then
         model.pendingRefresh = preferred or true
@@ -611,19 +605,21 @@ local function buildFrame(model)
     if width < 120 or height < 120 then return nil end
 
     local cfg = model.cfg
-    local compact = width < 300 or height < 300
-    local padX = math.max(12, math.min(20, width * 0.05))
-    local padY = compact and 12 or 18
-    local headerHeight = compact and 28 or 32
-    local filterHeight = compact and 28 or 32
-    local searchOpen = SEARCH_INPUT and model.searchOpen == true
-        and height >= 180
-    local searchHeight = searchOpen and (compact and 26 or 30) or 0
-    local searchTop = padY + headerHeight + 10 + filterHeight + 6
-    local bodyTop = padY + headerHeight + 10 + filterHeight + 14
-    if searchOpen then bodyTop = searchTop + searchHeight + 10 end
+    local compact = width < 300 or height < 240
+    local controlRow = ui.metrics().layoutRowHeight
+    local padX = math.max(8, math.min(14, width * 0.045))
+    local contentWidth = width - padX * 2
+    -- A tall, narrow card still needs room for the title and tab labels.
+    local controlSize = math.min(controlRow, math.max(28, contentWidth / 9))
+    local padY = controlRow * 7 / 28
+    local rowGap = controlRow * 3 / 28
+    local filterTop = padY + controlRow + rowGap
+    local searchTop = filterTop + controlRow + rowGap
+    local canSearch = SEARCH_INPUT and height >= searchTop + controlRow * 2 + padY
+    local searchOpen = canSearch and model.searchOpen == true
+    local bodyTop = searchTop + (searchOpen and controlRow + rowGap or 0)
     local bodyBottom = height - padY
-    local rowHeight = compact and 62 or 76
+    local rowHeight = compact and 54 or 64
     local rows = clipboard.filtered(model.history, cfg.filter)
     local query = searchOpen
         and string.lower(tostring(model.searchQuery or "")) or ""
@@ -642,212 +638,106 @@ local function buildFrame(model)
     local cellWidth = ((width - padX * 2) - gap * (columns - 1)) / columns
 
     return {
-        width = width, height = height,
+        width = width,
         left = padX, right = width - padX, top = padY,
-        headerHeight = headerHeight, filterHeight = filterHeight,
-        filterTop = padY + headerHeight + 10,
-        searchOpen = searchOpen, searchTop = searchTop,
-        searchHeight = searchHeight,
+        controlRow = controlRow, controlSize = controlSize,
+        filterTop = filterTop,
+        canSearch = canSearch, searchOpen = searchOpen, searchTop = searchTop,
         bodyTop = bodyTop, bodyBottom = bodyBottom,
         bodyHeight = math.max(1, bodyBottom - bodyTop),
         rowHeight = rowHeight,
         columns = columns, gap = gap, cellWidth = cellWidth,
         rows = rows,
         count = #rows,
-        total = #model.history,
         cfg = cfg,
         compact = compact,
         model = model,
         c = paletteCached(model),
-        titleFont = compact and 15 or 18,
-        metaFont = compact and 10 or 11,
+        titleFont = controlSize * 16 / 28,
+        metaFont = controlSize * 11 / 28,
         rowTitleFont = compact and 11 or 13,
         rowMetaFont = compact and 10 or 11,
-        capture = compact and 27 or 29,
     }
 end
 
--- Glyphs -------------------------------------------------------------------
+-- Fluent System Icons Regular 20 from the font bundled with SnowDesktop.
+local GLYPHS = {
+    all = "\u{f406}",
+    text = "\u{e557}",
+    image = "\u{f488}",
+    files = "\u{f418}",
+    link = "\u{f4e4}",
+    code = "\u{f2ef}",
+    refresh = "\u{f190}",
+    clipboard = "\u{f2c9}",
+    search = "\u{f68f}",
+    delete = "\u{f34c}",
+    copy = "\u{f32b}",
+    pin = "\u{f601}",
+    unpin = "\u{f603}",
+    close = "\u{f369}",
+    history = "\u{f47e}",
+    settings = "\u{f6a9}",
+    warning = "\u{f869}",
+}
 
-local function drawRefresh(cx, cy, size, color, alpha)
-    local half = size / 2
-    -- Two open arcs with compact arrowheads: refresh, not "add" or "paste".
-    draw.arc(cx, cy, half * 0.76, 35, 160, 1.65, color, alpha)
-    draw.arc(cx, cy, half * 0.76, 215, 160, 1.65, color, alpha)
-    draw.line(cx + half * 0.66, cy - half * 0.78,
-        cx + half * 0.96, cy - half * 0.18, 1.65, color, alpha)
-    draw.line(cx + half * 0.96, cy - half * 0.18,
-        cx + half * 0.29, cy - half * 0.24, 1.65, color, alpha)
-    draw.line(cx - half * 0.66, cy + half * 0.78,
-        cx - half * 0.96, cy + half * 0.18, 1.65, color, alpha)
-    draw.line(cx - half * 0.96, cy + half * 0.18,
-        cx - half * 0.29, cy + half * 0.24, 1.65, color, alpha)
+local function drawGlyph(kind, cx, cy, size, color)
+    draw.fluent(GLYPHS[kind], cx - size / 2, cy - size / 2, size, color)
 end
 
-local function drawFunnel(cx, cy, size, color, alpha)
-    local half = size / 2
-    draw.line(cx - half, cy - half * 0.7, cx + half, cy - half * 0.7, 1.5,
-        color, alpha)
-    draw.line(cx - half * 0.6, cy + 0.5, cx + half * 0.6, cy + 0.5, 1.5,
-        color, alpha)
-    draw.line(cx - half * 0.24, cy + half * 0.7, cx + half * 0.24,
-        cy + half * 0.7, 1.5, color, alpha)
-end
-
-local function drawCopy(cx, cy, size, color, alpha)
-    local half = size / 2
-    draw.strokeRect(cx - half * 0.76, cy - half * 0.18, half * 1.2,
-        half * 1.16, color, 2, 1.5, alpha)
-    draw.strokeRect(cx - half * 0.25, cy - half * 0.96, half * 1.2,
-        half * 1.16, color, 2, 1.5, alpha)
-end
-
-local drawRowGlyph
-
-local function drawFilter(kind, cx, cy, size, color, alpha)
-    if kind == "all" then
-        drawFunnel(cx, cy, size, color, alpha)
-    else
-        drawRowGlyph(kind, cx, cy, size, color, alpha)
+local function centeredTextY(metrics, cy)
+    if metrics.ink and metrics.ink.height > 0 then
+        return cy - metrics.ink.top - metrics.ink.height / 2
     end
-end
-
-local function drawTrash(cx, cy, size, color, alpha)
-    local half = size / 2
-    -- Lid, handle, open rim and two ribs read clearly at compact sizes.
-    draw.line(cx - half * 0.82, cy - half * 0.56,
-        cx + half * 0.82, cy - half * 0.56, 1.45, color, alpha)
-    draw.line(cx - half * 0.22, cy - half * 0.84,
-        cx + half * 0.22, cy - half * 0.84, 1.45, color, alpha)
-    draw.line(cx - half * 0.22, cy - half * 0.84,
-        cx - half * 0.22, cy - half * 0.56, 1.45, color, alpha)
-    draw.line(cx + half * 0.22, cy - half * 0.84,
-        cx + half * 0.22, cy - half * 0.56, 1.45, color, alpha)
-    draw.strokeRect(cx - half * 0.60, cy - half * 0.30,
-        half * 1.20, half * 1.08, color, 1.6, 1.35, alpha)
-    draw.line(cx - half * 0.19, cy - half * 0.04,
-        cx - half * 0.19, cy + half * 0.51, 1.15, color, alpha)
-    draw.line(cx + half * 0.19, cy - half * 0.04,
-        cx + half * 0.19, cy + half * 0.51, 1.15, color, alpha)
-end
-
-local function drawPin(cx, cy, size, color, alpha)
-    draw.line(cx + size * 0.18, cy - size * 0.20,
-        cx - size * 0.25, cy + size * 0.48, 1.4, color, alpha)
-    draw.strokeRect(cx - size * 0.42, cy - size * 0.40, size * 0.72,
-        size * 0.44, color, size * 0.13, 1.4, alpha)
-    draw.line(cx - size * 0.48, cy - size * 0.50,
-        cx + size * 0.38, cy - size * 0.50, 1.4, color, alpha)
-end
-
-local function drawClipboardGlyph(cx, cy, size, color, alpha)
-    local half = size / 2
-    draw.strokeRect(cx - half * 0.7, cy - half * 0.8, half * 1.4,
-        half * 1.7, color, math.max(2, half * 0.18), 1.5, alpha)
-    draw.rect(cx - half * 0.3, cy - half * 1.0, half * 0.6, half * 0.3,
-        color, half * 0.12, alpha)
-    draw.line(cx - half * 0.34, cy - half * 0.3, cx + half * 0.34,
-        cy - half * 0.3, 1.2, color, alpha * 0.75)
-    draw.line(cx - half * 0.34, cy + half * 0.02, cx + half * 0.34,
-        cy + half * 0.02, 1.2, color, alpha * 0.75)
-end
-
-drawRowGlyph = function(kind, cx, cy, size, color, alpha)
-    local half = size / 2
-    if kind == "link" then
-        draw.line(cx - half * 0.5, cy + half * 0.5, cx + half * 0.5,
-            cy - half * 0.5, 1.6, color, alpha)
-        draw.strokeRect(cx - half * 0.92, cy + half * 0.08, half * 0.6,
-            half * 0.6, color, half * 0.3, 1.3, alpha)
-        draw.strokeRect(cx + half * 0.32, cy - half * 0.68, half * 0.6,
-            half * 0.6, color, half * 0.3, 1.3, alpha)
-    elseif kind == "code" then
-        draw.line(cx - half * 0.18, cy - half * 0.58, cx - half * 0.72, cy,
-            1.6, color, alpha)
-        draw.line(cx - half * 0.72, cy, cx - half * 0.18, cy + half * 0.58,
-            1.6, color, alpha)
-        draw.line(cx + half * 0.18, cy - half * 0.58, cx + half * 0.72, cy,
-            1.6, color, alpha)
-        draw.line(cx + half * 0.72, cy, cx + half * 0.18, cy + half * 0.58,
-            1.6, color, alpha)
-    elseif kind == "image" then
-        draw.strokeRect(cx - half * 0.78, cy - half * 0.62, half * 1.56,
-            half * 1.24, color, 2, 1.4, alpha)
-        draw.rect(cx + half * 0.28, cy - half * 0.34, half * 0.24,
-            half * 0.24, color, half * 0.12, alpha)
-        draw.line(cx - half * 0.72, cy + half * 0.52, cx - half * 0.1,
-            cy - half * 0.04, 1.4, color, alpha)
-        draw.line(cx - half * 0.1, cy - half * 0.04, cx + half * 0.72,
-            cy + half * 0.52, 1.4, color, alpha)
-    elseif kind == "files" then
-        draw.strokeRect(cx - half * 0.82, cy - half * 0.55, half * 1.64,
-            half * 1.2, color, 2, 1.4, alpha)
-        draw.line(cx - half * 0.34, cy - half * 0.55, cx - half * 0.18,
-            cy - half * 0.3, 1.4, color, alpha)
-    else
-        draw.line(cx - half * 0.58, cy - half * 0.52, cx + half * 0.58,
-            cy - half * 0.52, 1.5, color, alpha)
-        draw.line(cx - half * 0.58, cy - half * 0.04, cx + half * 0.58,
-            cy - half * 0.04, 1.5, color, alpha)
-        draw.line(cx - half * 0.58, cy + half * 0.44, cx + half * 0.12,
-            cy + half * 0.44, 1.5, color, alpha)
-    end
+    return cy - metrics.height / 2
 end
 
 -- Header -------------------------------------------------------------------
-
-local function drawChevron(cx, cy, size, color, alpha)
-    draw.line(cx - size * 0.45, cy - size * 0.18, cx, cy + size * 0.25,
-        1.3, color, alpha)
-    draw.line(cx, cy + size * 0.25, cx + size * 0.45, cy - size * 0.18,
-        1.3, color, alpha)
-end
-
-local function drawSearchGlyph(cx, cy, size, color, alpha)
-    -- Lens ring in two arcs plus a handle at forty-five degrees.
-    draw.arc(cx, cy, size * 0.30, 0, 180, 1.5, color, alpha)
-    draw.arc(cx, cy, size * 0.30, 180, 180, 1.5, color, alpha)
-    draw.line(cx + size * 0.21, cy + size * 0.21,
-        cx + size * 0.44, cy + size * 0.44, 1.6, color, alpha)
-end
 
 -- The header title only changes with card size; keep it off the measure path.
 local function headerTitle(model, font, room)
     local key = tostring(font) .. "\1" .. tostring(room)
     local cache = model._headerTitle
     if cache and cache.key == key then return cache.value end
-    local value = ellipsize(l10n.tr("lua_widget.clipboard.name"), font, room, true)
+    local title = ellipsize(l10n.tr("lua_widget.clipboard.name"), font, room, true)
+    local value = { text = title, metrics = draw.measureText(title, font, 0, true) }
     model._headerTitle = { key = key, value = value }
     return value
 end
 
 local function drawHeader(f, model)
     local ink = f.c.ink
-    local cy = f.top + f.headerHeight / 2
-    local buttonSize = f.capture
-    local gap = f.compact and 6 or 8
-    local captureX = f.right - buttonSize
-    local clearX = captureX - gap - buttonSize
-    local filterX = clearX - gap - buttonSize
-    local searchX = SEARCH_INPUT and (filterX - gap - buttonSize) or nil
-    local titleRoom = (searchX or filterX) - 12 - f.left
+    local row = f.controlRow
+    local cy = f.top + row / 2
+    local buttonWidth = math.min(f.controlSize * 21 / 28, (f.right - f.left) / 5)
+    local iconSize = math.min(f.controlSize * 16 / 28, buttonWidth - 2)
+    local gap = f.controlSize * 4 / 28
+    local captureX = f.right - buttonWidth
+    local clearX = captureX - gap - buttonWidth
+    local filterX = f.width >= 235 and (clearX - gap - buttonWidth) or nil
+    local searchX = f.canSearch and ((filterX or clearX) - gap - buttonWidth) or nil
+    local showWarning = model.cfg.autoWatch and model.watchError
+        and model.watchError ~= "permissionDenied"
+    local titleRoom = (searchX or filterX or clearX) - (showWarning and 20 or 5) - f.left
     local title = headerTitle(model, f.titleFont, titleRoom)
-    draw.text(f.left, cy - f.titleFont / 2, title, f.titleFont, ink,
-        titleRoom, true, true, 0, 0.97)
+    if title.text ~= "" then
+        local titleX = f.left - (title.metrics.ink and title.metrics.ink.left or 0)
+        draw.text(titleX, centeredTextY(title.metrics, cy), title.text,
+            f.titleFont, ink, titleRoom, true, true, 0, 0.97)
+    end
 
-    -- Amber dot while the native helper is down; click retries immediately.
-    if model.cfg.autoWatch and model.watchError and not model.watchId then
-        local badgeX = f.left + textWidth(title, f.titleFont, true) + 10
-        draw.circle(badgeX, cy, 3.2, 0xE8B467, 0.95)
+    if showWarning and titleRoom >= 12 then
+        local badgeX = f.left + title.metrics.width + 9
+        drawGlyph("warning", badgeX, cy, 12, f.c.muted)
         interaction.region({
             key = "watch.badge",
             shape = { type = "roundedRect", x = badgeX - 5, y = cy - 7,
                 width = 11, height = 14, radius = 5 },
-            cursor = "default",
+            cursor = "hand",
             events = { click = { id = "watch.retry" } },
             tooltip = TOOLTIPS and
                 l10n.tr("lua_widget.clipboard.badge_watch_offline") or nil,
-            accessibility = { role = "text",
+            accessibility = { role = "button",
                 label = l10n.tr("lua_widget.clipboard.badge_watch_offline") },
         })
     end
@@ -856,16 +746,16 @@ local function drawHeader(f, model)
         local searchKey = "search.toggle"
         local searchActive = f.searchOpen == true
         local searchHovered = interaction.isHovered(searchKey)
-        draw.rect(searchX, cy - buttonSize / 2, buttonSize, buttonSize,
+        draw.rect(searchX, f.top, buttonWidth, row,
             searchActive and f.c.accent or ink, 7,
             searchActive and HEADER_BG_ACTIVE
                 or (searchHovered and HEADER_BG_HOVER or 0))
-        drawSearchGlyph(searchX + buttonSize / 2, cy, 14,
-            searchActive and f.c.accent or ink, 0.65)
+        drawGlyph("search", searchX + buttonWidth / 2, cy, iconSize,
+            searchActive and f.c.accent or f.c.muted)
         local searchRegion = {
             key = searchKey,
-            shape = { type = "roundedRect", x = searchX, y = cy - buttonSize / 2,
-                width = buttonSize, height = buttonSize, radius = 7 },
+            shape = { type = "roundedRect", x = searchX, y = f.top,
+                width = buttonWidth, height = row, radius = 7 },
             cursor = "hand",
             events = { click = { id = "search.toggle" } },
             accessibility = { role = "button",
@@ -877,43 +767,46 @@ local function drawHeader(f, model)
         interaction.region(searchRegion)
     end
 
-    local filterKey = "filter"
-    local hovered = interaction.isHovered(filterKey)
-    draw.rect(filterX, cy - buttonSize / 2, buttonSize, buttonSize,
-        f.cfg.filter ~= "all" and f.c.accent or ink, 7,
-        f.cfg.filter ~= "all" and HEADER_BG_ACTIVE
-            or (hovered and HEADER_BG_HOVER or 0))
-    drawFunnel(filterX + buttonSize / 2, cy, 14,
-        f.cfg.filter ~= "all" and f.c.accent or ink, 0.65)
-    local filterRegion = {
-        key = filterKey,
-        shape = { type = "roundedRect", x = filterX, y = cy - buttonSize / 2,
-            width = buttonSize, height = buttonSize, radius = 7 },
-        cursor = "hand",
-        events = {
-            click = { id = "filter.cycle" },
-            contextMenu = { id = "filter.menu" },
-        },
-        accessibility = { role = "button",
-            label = l10n.tr("lua_widget.clipboard.menu_filter") },
-    }
-    if TOOLTIPS then
-        filterRegion.tooltip = l10n.tr(FILTER_TOOLTIPS[f.cfg.filter])
+    if filterX then
+        local filterKey = "filter"
+        local active = f.cfg.filter ~= "all"
+        draw.rect(filterX, f.top, buttonWidth, row,
+            active and f.c.accent or ink, 7,
+            active and HEADER_BG_ACTIVE
+                or (interaction.isHovered(filterKey) and HEADER_BG_HOVER or 0))
+        -- The filter glyph's top-heavy strokes sit high next to the tools.
+        drawGlyph("all", filterX + buttonWidth / 2, cy + iconSize * 1.5 / 16, iconSize,
+            active and f.c.accent or f.c.muted)
+        local filterRegion = {
+            key = filterKey,
+            shape = { type = "roundedRect", x = filterX, y = f.top,
+                width = buttonWidth, height = row, radius = 7 },
+            cursor = "hand",
+            events = {
+                click = { id = "filter.cycle" },
+                contextMenu = { id = "filter.menu" },
+            },
+            accessibility = { role = "button",
+                label = l10n.tr("lua_widget.clipboard.menu_filter") },
+        }
+        if TOOLTIPS then
+            filterRegion.tooltip = l10n.tr(FILTER_TOOLTIPS[f.cfg.filter])
+        end
+        interaction.region(filterRegion)
     end
-    interaction.region(filterRegion)
 
     local clearKey = "clear"
     local armed = model.confirmAt > 0 and time.monotonic() < model.confirmAt
-    hovered = interaction.isHovered(clearKey)
-    draw.rect(clearX, cy - buttonSize / 2, buttonSize, buttonSize,
+    local hovered = interaction.isHovered(clearKey)
+    draw.rect(clearX, f.top, buttonWidth, row,
         armed and f.c.accent or ink, 7,
         armed and HEADER_BG_ACTIVE or (hovered and HEADER_BG_HOVER or 0))
-    drawTrash(clearX + buttonSize / 2, cy, 14,
-        armed and f.c.accent or ink, armed and 0.95 or 0.56)
+    drawGlyph("delete", clearX + buttonWidth / 2, cy, iconSize,
+        armed and f.c.accent or f.c.muted)
     local clearRegion = {
         key = clearKey,
-        shape = { type = "roundedRect", x = clearX, y = cy - buttonSize / 2,
-            width = buttonSize, height = buttonSize, radius = 7 },
+        shape = { type = "roundedRect", x = clearX, y = f.top,
+            width = buttonWidth, height = row, radius = 7 },
         cursor = "hand",
         events = { click = { id = "clear.click" } },
         accessibility = { role = "button",
@@ -929,15 +822,15 @@ local function drawHeader(f, model)
     local captureKey = "capture"
     hovered = interaction.isHovered(captureKey)
     local pressed = interaction.isPressed(captureKey)
-    draw.rect(captureX, cy - buttonSize / 2, buttonSize, buttonSize,
+    draw.rect(captureX, f.top, buttonWidth, row,
         ink, 7, pressed and HEADER_BG_ACTIVE
             or ((hovered or model.captureActive) and HEADER_BG_HOVER or 0))
-    drawRefresh(captureX + buttonSize / 2, cy, 17, f.c.accent,
-        model.captureActive and 0.45 or 0.92)
+    drawGlyph("refresh", captureX + buttonWidth / 2, cy - iconSize * 0.5 / 16, iconSize,
+        model.captureActive and f.c.muted or f.c.accent)
     local captureRegion = {
         key = captureKey,
-        shape = { type = "roundedRect", x = captureX, y = cy - buttonSize / 2,
-            width = buttonSize, height = buttonSize, radius = 7 },
+        shape = { type = "roundedRect", x = captureX, y = f.top,
+            width = buttonWidth, height = row, radius = 7 },
         cursor = "hand",
         events = {
             click = { id = "capture.refresh" },
@@ -954,23 +847,14 @@ end
 
 -- Category filters ----------------------------------------------------------
 
-local function drawFilters(f, _model)
+local function drawFilters(f)
     local ink = f.c.ink
     local y = f.filterTop
-    local height = f.filterHeight
+    local height = f.controlRow
     local cy = y + height / 2
-    local wide = f.width >= 340
-    local gap = wide and 6 or 0
-    local available = f.right - f.left
-    local countText = tostring(f.total)
-    local countW = wide and (textWidth(countText, f.metaFont, false) + 18) or 0
-    local groupWidth = wide and (available - countW - 8) or available
+    local wide = f.width >= 285
+    local groupWidth = f.right - f.left
     draw.rect(f.left, y, groupWidth, height, ink, 9, 0.055)
-    if wide then
-        draw.text(f.right - countW / 2 - textWidth(countText, f.metaFont) / 2,
-            cy - f.metaFont / 2, countText, f.metaFont, ink, 0,
-            false, true, 0, 0.46)
-    end
 
     local tabWidth = groupWidth / #FILTERS
     for index, key in ipairs(FILTERS) do
@@ -978,10 +862,12 @@ local function drawFilters(f, _model)
         local selected = f.cfg.filter == key
         local regionKey = "filter." .. key
         local hovered = interaction.isHovered(regionKey)
-        local label = wide and l10n.tr(FILTER_KEYS[key]) or ""
-        local font = f.metaFont + (wide and 0 or 1)
-        local glyphSize = wide and 12 or 14
-        local contentW = glyphSize + (wide and (5 + textWidth(label, font)) or 0)
+        local font = f.metaFont
+        local glyphSize = f.controlSize * (wide and 14 or 16) / 28
+        local label = wide and ellipsize(l10n.tr(FILTER_KEYS[key]), font,
+            tabWidth - glyphSize - 11, selected) or ""
+        local metrics = wide and draw.measureText(label, font, 0, selected)
+        local contentW = glyphSize + (wide and (4 + metrics.width) or 0)
         local gx = x + (tabWidth - contentW) / 2 + glyphSize / 2
         if selected then
             draw.rect(x + 2, y + 2, tabWidth - 4, height - 4,
@@ -991,12 +877,13 @@ local function drawFilters(f, _model)
         elseif hovered then
             draw.rect(x + 2, y + 2, tabWidth - 4, height - 4, ink, 7, 0.055)
         end
-        drawFilter(key, gx, cy, glyphSize,
-            selected and f.c.accent or ink, selected and 0.98 or 0.46)
+        -- Align the visible shapes with the center of the label ink.
+        local glyphY = cy + (key == "all" and glyphSize * 0.13 or glyphSize * 0.07)
+        drawGlyph(key, gx, glyphY, glyphSize, selected and f.c.accent or f.c.muted)
         if wide then
-            draw.text(gx + glyphSize / 2 + 5, cy - font / 2, label, font,
-                selected and f.c.accent or ink, tabWidth - contentW / 2,
-                selected, true, 0, selected and 0.98 or 0.52)
+            draw.text(gx + glyphSize / 2 + 4, centeredTextY(metrics, cy),
+                label, font, selected and f.c.accent or f.c.muted,
+                0, selected, true)
         end
         local region = {
             key = regionKey,
@@ -1101,17 +988,13 @@ local function rowMeta(entry, zh, now, nowParts)
     return timeText .. " · " .. sizeText
 end
 
-local function drawRowAction(f, key, x, y, size, glyph, color, alpha,
+local function drawRowAction(key, x, y, size, glyph, color,
         label, tooltip, value)
     local hovered = interaction.isHovered(key)
     local pressed = interaction.isPressed(key)
     draw.rect(x, y, size, size, color, 6,
         pressed and 0.20 or (hovered and 0.12 or 0))
-    if glyph == "copy" then
-        drawCopy(x + size / 2, y + size / 2, 13, color, alpha)
-    else
-        drawTrash(x + size / 2, y + size / 2, 13, color, alpha)
-    end
+    drawGlyph(glyph, x + size / 2, y + size / 2, 15, color)
     local region = {
         key = key,
         shape = { type = "roundedRect", x = x, y = y,
@@ -1139,7 +1022,7 @@ local function drawRow(f, entry, x, width, y, now, zh, nowParts)
 
     local glyphKind = entry.kind
     if glyphKind == "text" then glyphKind = clipboard.kindOfEntry(entry) end
-    local tint = TYPE_COLORS[glyphKind] or TYPE_COLORS.text
+    local tint = foregroundColor(TYPE_COLORS[glyphKind] or TYPE_COLORS.text, f.c.light)
     local tile = f.compact and 30 or 34
     local tileX = x + (f.compact and 9 or 12)
     local tileY = y + (height - tile) / 2
@@ -1147,29 +1030,30 @@ local function drawRow(f, entry, x, width, y, now, zh, nowParts)
         local ok = pcall(draw.image, entry.image, tileX, tileY, tile, tile, 0.98)
         if not ok then
             draw.rect(tileX, tileY, tile, tile, tint, 8, 0.10)
-            drawRowGlyph("image", tileX + tile / 2, tileY + tile / 2,
-                tile * 0.48, tint, 0.85)
+            drawGlyph("image", tileX + tile / 2, tileY + tile / 2,
+                tile * 0.55, tint)
         end
     elseif entry.kind == "image" and entry.pixels then
         draw.rect(tileX, tileY, tile, tile, tint, 6, 0.16)
         draw.pushClip(tileX + 2, tileY + 2, tile - 4, tile - 4)
-        local cellWidth = (tile - 4) / entry.pixels.width
-        local cellHeight = (tile - 4) / entry.pixels.height
+        local cellSize = (tile - 4) / math.max(entry.pixels.width, entry.pixels.height)
+        local imageX = tileX + (tile - entry.pixels.width * cellSize) / 2
+        local imageY = tileY + (tile - entry.pixels.height * cellSize) / 2
         for row = 1, #entry.pixels.rows do
             local runs = entry.pixels.rows[row]
             for index = 1, #runs do
                 local run = runs[index]
-                draw.rect(tileX + 2 + run.x * cellWidth,
-                    tileY + 2 + (row - 1) * cellHeight,
-                    run.width * cellWidth + 0.05, cellHeight + 0.05,
+                draw.rect(imageX + run.x * cellSize,
+                    imageY + (row - 1) * cellSize,
+                    run.width * cellSize + 0.05, cellSize + 0.05,
                     run.color, 0, 0.98)
             end
         end
         draw.popClip()
     else
         draw.rect(tileX, tileY, tile, tile, tint, 8, f.c.light and 0.075 or 0.09)
-        drawRowGlyph(glyphKind, tileX + tile / 2, tileY + tile / 2,
-            tile * 0.48, tint, 0.88)
+        drawGlyph(glyphKind, tileX + tile / 2, tileY + tile / 2,
+            tile * 0.56, tint)
     end
 
     local actionSize = f.compact and 20 or 22
@@ -1177,63 +1061,67 @@ local function drawRow(f, entry, x, width, y, now, zh, nowParts)
     local actionsX = x + width - 9 - actionSize * 2 - actionGap
     local textX = tileX + tile + (f.compact and 8 or 10)
     local titleMax = math.max(0, actionsX - 8 - textX)
-    local titleY = y + (height - f.rowTitleFont - f.rowMetaFont - 6) / 2
     local titleText = rowTitleCached(entry, zh)
     local titleKey = tostring(f.rowTitleFont) .. "\1" .. tostring(titleMax)
     local titleCache = entry._titleFit
-    local title
-    if titleCache and titleCache.key == titleKey
-        and titleCache.text == titleText then
-        title = titleCache.value
-    else
-        title = ellipsize(titleText, f.rowTitleFont, titleMax, false)
-        entry._titleFit = { key = titleKey, text = titleText, value = title }
+    if not titleCache or titleCache.key ~= titleKey or titleCache.text ~= titleText then
+        local title = ellipsize(titleText, f.rowTitleFont, titleMax, false)
+        titleCache = {
+            key = titleKey, text = titleText, value = title,
+            metrics = draw.measureText(title, f.rowTitleFont),
+        }
+        entry._titleFit = titleCache
     end
-    local code = entry.kind == "text" and glyphKind == "code"
-    local codeLines = code and (f.compact and 2 or 3) or 1
-    if code then
-        draw.pushClip(textX, titleY - 1, titleMax,
-            f.rowTitleFont * codeLines + 2)
-        draw.text(textX, titleY, entry.text, f.rowTitleFont, ink, titleMax,
-            false, false, f.rowTitleFont * codeLines + 2, 0.96)
-        draw.popClip()
-    else
-        draw.text(textX, titleY, title, f.rowTitleFont, ink, titleMax,
-            false, true, 0, 0.96)
-    end
-    local metaY = code and (y + height - f.rowMetaFont - 8)
-        or (titleY + f.rowTitleFont + 6)
     local metaText = rowMeta(entry, zh, now, nowParts)
     local metaKey = tostring(f.rowMetaFont) .. "\1" .. tostring(titleMax)
         .. "\1" .. metaText
     local metaCache = entry._metaFit
-    local meta
-    if metaCache and metaCache.key == metaKey then
-        meta = metaCache.value
-    else
-        meta = ellipsize(metaText, f.rowMetaFont, titleMax, false)
-        entry._metaFit = { key = metaKey, value = meta }
+    if not metaCache or metaCache.key ~= metaKey then
+        local meta = ellipsize(metaText, f.rowMetaFont, titleMax, false)
+        metaCache = {
+            key = metaKey, value = meta,
+            metrics = draw.measureText(meta, f.rowMetaFont),
+        }
+        entry._metaFit = metaCache
     end
-    draw.text(textX, metaY, meta, f.rowMetaFont, ink,
-        titleMax, false, true, 0, 0.58)
+    if titleMax > 0 then
+        local code = glyphKind == "code"
+        local titleLine = math.max(titleCache.metrics.height, f.rowTitleFont)
+        local metaLine = math.max(metaCache.metrics.height, f.rowMetaFont)
+        local titleHeight = code and titleLine * 2 or titleLine
+        local textGap = 2
+        local textTop = y + (height - titleHeight - metaLine - textGap) / 2
+        if code then
+            draw.pushClip(textX, textTop, titleMax, titleHeight)
+            draw.text(textX, textTop, entry.text, f.rowTitleFont, ink, titleMax,
+                false, false, titleHeight, 0.96)
+            draw.popClip()
+        else
+            draw.text(textX, centeredTextY(titleCache.metrics, textTop + titleLine / 2),
+                titleCache.value, f.rowTitleFont, ink, titleMax, false, true, 0, 0.96)
+        end
+        local metaY = textTop + titleHeight + textGap + metaLine / 2
+        draw.text(textX, centeredTextY(metaCache.metrics, metaY),
+            metaCache.value, f.rowMetaFont, f.c.muted, titleMax, false, true)
+    end
 
     local actionY = y + (height - actionSize) / 2
     if entry.kind == "text" then
         local copied = f.model ~= nil and f.model.copiedId == entry.id
-        drawRowAction(f, "copy." .. entry.id, actionsX, actionY, actionSize,
-            "copy", copied and f.c.accent or ink, hovered and 0.80 or 0.45,
+        drawRowAction("copy." .. entry.id, actionsX, actionY, actionSize,
+            "copy", copied and f.c.accent or f.c.muted,
             l10n.tr("lua_widget.clipboard.menu_copy"),
             l10n.tr("lua_widget.clipboard.menu_copy_hint"), entry.id)
     elseif entry.pinned then
-        drawPin(actionsX + actionSize / 2, actionY + actionSize / 2,
-            12, f.c.accent, 0.95)
+        drawGlyph("pin", actionsX + actionSize / 2, actionY + actionSize / 2,
+            14, f.c.accent)
     end
-    drawRowAction(f, "delete." .. entry.id, actionsX + actionSize + actionGap,
-        actionY, actionSize, "delete", ink, hovered and 0.72 or 0.40,
+    drawRowAction("delete." .. entry.id, actionsX + actionSize + actionGap,
+        actionY, actionSize, "delete", f.c.muted,
         l10n.tr("lua_widget.clipboard.menu_delete"),
         l10n.tr("lua_widget.clipboard.menu_delete_hint"), entry.id)
     if entry.pinned and entry.kind == "text" then
-        drawPin(x + 5, y + 8, 8, f.c.accent, 0.9)
+        drawGlyph("pin", x + 6, y + 7, 9, f.c.accent)
     end
 
     local regionTop = math.max(y, f.bodyTop)
@@ -1262,61 +1150,54 @@ local function drawRow(f, entry, x, width, y, now, zh, nowParts)
 end
 
 local function drawEmpty(f, model)
-    local ink = f.c.ink
-    local cx = f.left + (f.right - f.left) / 2
+    local cx = (f.left + f.right) / 2
     local filter = f.cfg.filter
-    local disc = f.compact and 34 or 44
-    local titleFont = f.compact and 12 or 14
-    local hintFont = f.compact and 10 or 11
-    local buttonHeight = 28
-    local spacing = f.compact and 10 or 16
     local searching = f.searchOpen and (model.searchQuery or "") ~= ""
-    local block = disc + spacing + titleFont + 6 + hintFont
-    if not searching then
-        block = block + spacing + buttonHeight
-    end
-    local top = f.bodyTop + math.max(0, (f.bodyHeight - block) / 2)
-    local discTop = math.max(f.bodyTop + 8, top)
-    draw.rect(cx - disc / 2, discTop, disc, disc, ink, disc / 2, 0.045)
-    drawClipboardGlyph(cx, discTop + disc / 2, disc * 0.48, ink, 0.32)
     local titleKey = searching and "lua_widget.clipboard.search_empty_title"
         or (filter == "all" and "lua_widget.clipboard.empty_title"
         or "lua_widget.clipboard.empty_filter")
-    local title = l10n.tr(titleKey)
-    draw.text(cx - textWidth(title, titleFont, false) / 2,
-        top + disc + spacing, title, titleFont, ink, 0, false, true, 0, 0.78)
-    local hintKey = searching and "lua_widget.clipboard.search_empty_hint"
-        or (filter ~= "all" and "lua_widget.clipboard.empty_category_hint"
-        or (model.watchId and "lua_widget.clipboard.empty_hint"
-            or "lua_widget.clipboard.empty_hint_manual"))
-    local hintText = ellipsize(l10n.tr(hintKey), hintFont,
-        f.right - f.left - 8, false)
-    if hintText ~= "" then
-        draw.text(cx - textWidth(hintText, hintFont, false) / 2,
-            top + disc + spacing + titleFont + 6, hintText, hintFont, ink,
-            0, false, true, 0, 0.42)
-    end
-    if searching then return end
+    local font = f.compact and 12 or 14
+    local iconSize, gap = 17, 6
+    local width = f.right - f.left
+    local title = ellipsize(l10n.tr(titleKey), font, width - iconSize - gap, false)
+    local metrics = draw.measureText(title, font)
+    local x = cx - (iconSize + gap + metrics.width) / 2
+    local showAction = not searching and f.bodyHeight >= 58
+    local buttonHeight = 26
+    local blockHeight = math.max(iconSize, metrics.height) + (showAction and 9 + buttonHeight or 0)
+    local centerY = f.bodyTop + math.max(0, (f.bodyHeight - blockHeight) / 2)
+        + math.max(iconSize, metrics.height) / 2
+    drawGlyph(searching and "search" or "clipboard",
+        x + iconSize / 2, centerY, iconSize, f.c.muted)
+    draw.text(x + iconSize + gap, centeredTextY(metrics, centerY), title,
+        font, f.c.ink, 0, false, true, 0, 0.78)
+    if not showAction then return end
+
     local actionKey = filter == "image" and "lua_widget.clipboard.menu_capture_image"
         or (filter == "files" and "lua_widget.clipboard.menu_capture_files"
             or "lua_widget.clipboard.empty_action")
-    local label = l10n.tr(actionKey)
-    local width = math.min(f.right - f.left, textWidth(label, hintFont, true) + 36)
-    local x = cx - width / 2
-    local y = top + disc + spacing + titleFont + 6 + hintFont + spacing
-    draw.rect(x, y, width, buttonHeight, f.c.accent, 8, 0.92)
-    draw.text(cx - textWidth(label, hintFont, true) / 2,
-        y + (buttonHeight - hintFont) / 2, label, hintFont, f.c.accentInk,
-        0, true, true, 0, 0.98)
+    local action = filter == "image" and "capture.image"
+        or (filter == "files" and "capture.files" or "capture.refresh")
+    local buttonFont = 11
+    local label = ellipsize(l10n.tr(actionKey), buttonFont, width - 20, true)
+    local labelMetrics = draw.measureText(label, buttonFont, 0, true)
+    local buttonWidth = labelMetrics.width + 20
+    local buttonX = cx - buttonWidth / 2
+    local buttonY = centerY + math.max(iconSize, metrics.height) / 2 + 9
+    draw.rect(buttonX, buttonY, buttonWidth, buttonHeight, f.c.accent, 7, 0.92)
+    draw.text(cx - labelMetrics.width / 2,
+        centeredTextY(labelMetrics, buttonY + buttonHeight / 2),
+        label, buttonFont, f.c.accentInk, 0, true, true, 0, 0.98)
     interaction.region({
         key = "empty.capture",
-        shape = { type = "roundedRect", x = x, y = y, width = width,
-            height = buttonHeight, radius = 8 },
+        shape = { type = "roundedRect", x = buttonX, y = buttonY,
+            width = buttonWidth, height = buttonHeight, radius = 7 },
         cursor = "hand",
         events = {
-            click = { id = "capture.refresh" },
+            click = { id = action },
             contextMenu = { id = "capture.menu" },
         },
+        accessibility = { role = "button", label = label },
     })
 end
 
@@ -1326,11 +1207,10 @@ end
 local function drawSearchRow(f, model)
     local ink = f.c.ink
     local y = f.searchTop
-    local height = f.searchHeight
+    local height = f.controlRow
     -- Close button mirrors the row-action scale: small rounded hit area, a
     -- compact ✕ glyph, flush with the right edge like the header buttons.
     local closeSize = math.max(18, height - 4)
-    local glyph = math.floor(closeSize * 0.40)
     local closeX = f.right - closeSize
     local inputRight = closeX - 8
     model.searchQuery = tostring(control.textInput({
@@ -1357,10 +1237,7 @@ local function drawSearchRow(f, model)
     local hovered = interaction.isHovered(key)
     draw.rect(closeX, cy - closeSize / 2, closeSize, closeSize, ink, 6,
         hovered and 0.14 or 0)
-    local gx = closeX + closeSize / 2
-    local half = glyph / 2
-    draw.line(gx - half, cy - half, gx + half, cy + half, 1.6, ink, 0.72)
-    draw.line(gx + half, cy - half, gx - half, cy + half, 1.6, ink, 0.72)
+    drawGlyph("close", closeX + closeSize / 2, cy, 15, f.c.muted)
     interaction.region({
         key = key,
         shape = { type = "roundedRect", x = closeX, y = cy - closeSize / 2,
@@ -1398,10 +1275,10 @@ local function render(_context, model)
     if not f then return end
 
     drawHeader(f, model)
-    drawFilters(f, model)
+    drawFilters(f)
     if f.searchOpen then drawSearchRow(f, model) end
-    draw.line(f.left, f.bodyTop - 7, f.right, f.bodyTop - 7, 1, f.c.ink, 0.07)
 
+    if f.bodyHeight < f.controlRow / 2 then return end
     if f.count == 0 then
         drawEmpty(f, model)
     else
@@ -1447,9 +1324,8 @@ local function setup(context)
         confirmAt = 0,
         cfg = config(),
         preview = context.preview == true,
-        watchId = nil,
+        watch = nil,
         watchError = nil,
-        watchAttempts = 0,
         searchOpen = false,
         searchQuery = "",
         copiedId = nil,
@@ -1480,23 +1356,33 @@ local function menu(_context, model, _request)
     if request.id == "capture.menu" then
         local items = {
             { id = "capture.refresh",
-                label = l10n.tr("lua_widget.clipboard.menu_capture") },
+                label = l10n.tr("lua_widget.clipboard.menu_capture"),
+                icon = GLYPHS.refresh, iconFont = "fluent" },
             { id = "capture.text",
-                label = l10n.tr("lua_widget.clipboard.menu_capture_text") },
+                label = l10n.tr("lua_widget.clipboard.menu_capture_text"),
+                icon = GLYPHS.text, iconFont = "fluent" },
             { id = "capture.image",
-                label = l10n.tr("lua_widget.clipboard.menu_capture_image") },
+                label = l10n.tr("lua_widget.clipboard.menu_capture_image"),
+                icon = GLYPHS.image, iconFont = "fluent" },
             { id = "capture.files",
-                label = l10n.tr("lua_widget.clipboard.menu_capture_files") },
+                label = l10n.tr("lua_widget.clipboard.menu_capture_files"),
+                icon = GLYPHS.files, iconFont = "fluent" },
             { type = "separator" },
         }
+        local watchStatus = model.watch and "lua_widget.clipboard.watch_on"
+            or "lua_widget.clipboard.watch_off"
+        if model.cfg.autoWatch and model.watchError == "permissionDenied" then
+            watchStatus = "lua_widget.clipboard.watch_permission"
+        end
         items[#items + 1] = {
             id = "watch.toggle",
-            label = l10n.tr("lua_widget.clipboard.menu_watch"),
-            checked = model.cfg.autoWatch,
+            label = l10n.tr("lua_widget.clipboard.menu_watch") .. "\t" .. l10n.tr(watchStatus),
+            icon = GLYPHS.history, iconFont = "fluent",
         }
         items[#items + 1] = {
             id = "settings.open",
             label = l10n.tr("lua_widget.clipboard.menu_settings"),
+            icon = GLYPHS.settings, iconFont = "fluent",
         }
         return ui.menu(items)
     end
@@ -1505,11 +1391,15 @@ local function menu(_context, model, _request)
         local items = {}
         for index = 1, #MENU_FILTERS do
             local key = MENU_FILTERS[index]
+            local label = l10n.tr(FILTER_KEYS[key])
+            if model.cfg.filter == key then
+                label = label .. "\t" .. l10n.tr("lua_widget.clipboard.menu_selected")
+            end
             items[#items + 1] = {
                 id = "filter.set:" .. key,
                 value = key,
-                label = l10n.tr(FILTER_KEYS[key]),
-                checked = model.cfg.filter == key,
+                label = label,
+                icon = GLYPHS[key], iconFont = "fluent",
             }
         end
         return ui.menu(items)
@@ -1530,17 +1420,21 @@ local function menu(_context, model, _request)
                 id = "entry.copy:" .. id,
                 label = l10n.tr("lua_widget.clipboard.menu_copy"),
                 enabled = entry.kind == "text",
+                icon = GLYPHS.copy, iconFont = "fluent",
             },
             {
                 id = "entry.pin:" .. id,
                 label = l10n.tr(entry.pinned and
                     "lua_widget.clipboard.menu_unpin" or
                     "lua_widget.clipboard.menu_pin"),
+                icon = entry.pinned and GLYPHS.unpin or GLYPHS.pin,
+                iconFont = "fluent",
             },
             { type = "separator" },
             {
                 id = "entry.delete:" .. id,
                 label = l10n.tr("lua_widget.clipboard.menu_delete"),
+                icon = GLYPHS.delete, iconFont = "fluent",
             },
         }
         return ui.menu(items)
@@ -1631,9 +1525,7 @@ local function handleAction(model, value)
         storage.set("searchQuery", "")
         widget.invalidate()
     elseif id == "watch.retry" then
-        model.watchError = nil
-        model.watchAttempts = 0
-        if model.cfg.autoWatch and not model.watchId then startWatch(model) end
+        startWatch(model)
         widget.invalidate()
     elseif id == "watch.toggle" then
         storage.set("autoWatch", model.cfg.autoWatch and "false" or "true")
@@ -1653,15 +1545,7 @@ end
 
 local function handleTask(model, value)
     local job = model.tasks[value.taskId]
-    if not job then
-        if value.taskId == model.watchId then
-            model.watchId = nil
-            model.watchError = value.error or "nativeExited"
-            scheduleWatchRetry(model)
-            widget.invalidate()
-        end
-        return
-    end
+    if not job then return end
     model.tasks[value.taskId] = nil
     local batch = model.captureBatch
     if not batch or batch.generation ~= job.generation then batch = nil end
@@ -1738,62 +1622,49 @@ local function handleTask(model, value)
     else widget.invalidate() end
 end
 
+local function onClipboardChange(model, value)
+    if not model.watch or type(value) ~= "table" then return end
+    model.watchKind = nil
+    model.watchEntryId = nil
+    if value.format == "text" then
+        model.watchKind = "text"
+        addTextEntry(model, value.text)
+    elseif value.format == "image" and model.cfg.captureImages then
+        local pixels = thumbnail.decode(value.rgb, value.width, value.height)
+        if not pixels then return end
+        local now = time.now()
+        local entry = {
+            id = nextId(model, now), ts = now, pinned = false,
+            kind = "image", imageData = value.rgb,
+            pixels = pixels, width = pixels.width, height = pixels.height,
+        }
+        addSessionEntry(model, entry)
+        model.watchKind = "image"
+        model.watchEntryId = entry.id
+    elseif value.format == "file-names" and model.cfg.captureFiles then
+        local names = {}
+        for index, name in ipairs(value.names) do
+            names[index] = clipboard.truncate(name, 256)
+        end
+        local now = time.now()
+        local entry = {
+            id = nextId(model, now), ts = now, pinned = false,
+            kind = "files", names = names,
+        }
+        addSessionEntry(model, entry)
+        model.watchKind = "files"
+        model.watchEntryId = entry.id
+    elseif value.error == "clipboardTooLarge" then
+        toast(model, l10n.tr("lua_widget.clipboard.toast_too_long"))
+    elseif value.error then
+        toast(model, l10n.tr("lua_widget.clipboard.toast_read_failed"))
+    end
+end
+
 local function event(_context, model, value)
     if type(value) ~= "table" then return end
-    if value.kind == "native.event" then
-        if value.taskId == model.watchId and type(value.value) == "table" then
-            local payload = value.value
-            if payload.ignored then
-                -- The native helper saw a source-app privacy marker. It never
-                -- read the payload, so do not fall through to another branch.
-                model.watchKind = nil
-                model.watchEntryId = nil
-            elseif type(payload.files) == "table" and model.cfg.captureFiles then
-                -- Files outrank text: file copies can also expose path text.
-                local names = {}
-                for index = 1, math.min(32, #payload.files) do
-                    local name = payload.files[index]
-                    if type(name) == "string" and name ~= "" then
-                        names[#names + 1] = clipboard.truncate(name, 256)
-                    end
-                end
-                if #names > 0 then
-                    model.watchKind = "files"
-                    local now = time.now()
-                    local entry = {
-                        id = nextId(model, now), ts = now, pinned = false,
-                        kind = "files", names = names,
-                    }
-                    addSessionEntry(model, entry)
-                    model.watchEntryId = entry.id
-                end
-            elseif type(payload.text) == "string" and payload.text ~= "" then
-                model.watchKind = "text"
-                model.watchEntryId = nil
-                addTextEntry(model, payload.text)
-            elseif type(payload.imageData) == "string" and model.cfg.captureImages then
-                local pixels = thumbnail.decode(payload.imageData,
-                    payload.width, payload.height)
-                if pixels then
-                    model.watchKind = "image"
-                    model.watchEntryId = nil
-                    local now = time.now()
-                    local entry = {
-                        id = nextId(model, now), ts = now, pinned = false,
-                        kind = "image", imageData = payload.imageData,
-                        pixels = pixels, width = pixels.width, height = pixels.height,
-                    }
-                    addSessionEntry(model, entry)
-                    model.watchEntryId = entry.id
-                else
-                    toast(model, l10n.tr("lua_widget.clipboard.toast_read_failed"))
-                end
-            elseif payload.tooLarge then
-                toast(model, l10n.tr("lua_widget.clipboard.toast_too_long"))
-            elseif payload.captureError then
-                toast(model, l10n.tr("lua_widget.clipboard.toast_read_failed"))
-            end
-        end
+    if value.kind == "data.change" and value.topic == "clipboard.changes" then
+        onClipboardChange(model, value.clipboard)
         return
     end
     if value.kind == "action" then
@@ -1817,11 +1688,6 @@ local function event(_context, model, value)
         elseif value.id == "copiedMark" then
             model.copiedId = nil
             widget.invalidate()
-        elseif value.id == "watchRetry" then
-            if model.cfg.autoWatch and not model.watchId then
-                startWatch(model)
-                widget.invalidate()
-            end
         end
         return
     end
@@ -1852,7 +1718,6 @@ local function dispose(_context, model)
     schedule.cancel("clearConfirm")
     schedule.cancel("captureNext")
     schedule.cancel("copiedMark")
-    schedule.cancel("watchRetry")
     model.captureGeneration = (model.captureGeneration or 0) + 1
     model.captureActive = false
     model.captureBatch = nil
