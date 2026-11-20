@@ -294,21 +294,20 @@ local function hasPending(model, kind)
     return false
 end
 
--- Every clipboard change gets its own entry. An explicit manual refresh may
--- enrich its watched row with a host handle/reference; it never replaces other
--- images or files merely because they belong to the same category.
 local function addSessionEntry(model, entry)
-    local sorted, dropped
-    if entry.refreshId then
-        local enriched
-        sorted, enriched = clipboard.enrichSession(model.history, entry.refreshId, entry)
-        if not enriched then
-            entry.refreshId = nil
-            sorted, dropped = clipboard.upsert(model.history, entry, model.cfg.maxCount)
-        else
-            dropped = {}
-        end
+    local target = entry.refreshId
+    if entry.kind == "image" and entry.imageId then
+        target = clipboard.findImageEntryId(model.history, entry.imageId)
+    end
+    local sorted, enriched, dropped
+    if target then
+        sorted, enriched = clipboard.enrichSession(model.history, target, entry)
+    end
+    if enriched then
+        dropped = {}
     else
+        target = entry.id
+        entry.refreshId = nil
         sorted, dropped = clipboard.upsert(model.history, entry, model.cfg.maxCount)
     end
     if not removeDropped({}, dropped) then
@@ -317,7 +316,9 @@ local function addSessionEntry(model, entry)
     end
     model.history = sorted
     widget.invalidate()
-    return true
+    for _, kept in ipairs(sorted) do
+        if kept.id == target then return target end
+    end
 end
 
 local function hasIdentity(model, text)
@@ -1603,7 +1604,7 @@ local function handleTask(model, value)
             local height = tonumber(result.height) or 0
             captured = addSessionEntry(model, {
                 id = nextId(model, now), ts = now, pinned = false,
-                kind = "image", image = result.image,
+                kind = "image", image = result.image, imageId = result.imageId,
                 width = width, height = height, refreshId = job.refreshId,
             })
         end
@@ -1646,14 +1647,13 @@ local function onClipboardChange(model, value)
         local now = time.now()
         local entry = {
             id = nextId(model, now), ts = now, pinned = false,
-            kind = "image", image = image, imageData = value.rgb,
+            kind = "image", image = image, imageId = value.imageId, imageData = value.rgb,
             pixels = pixels,
             width = image and value.imageWidth or pixels.width,
             height = image and value.imageHeight or pixels.height,
         }
-        addSessionEntry(model, entry)
+        model.watchEntryId = addSessionEntry(model, entry)
         model.watchKind = "image"
-        model.watchEntryId = entry.id
     elseif value.format == "file-names" and model.cfg.captureFiles then
         local names = {}
         for index, name in ipairs(value.names) do
@@ -1664,9 +1664,8 @@ local function onClipboardChange(model, value)
             id = nextId(model, now), ts = now, pinned = false,
             kind = "files", names = names,
         }
-        addSessionEntry(model, entry)
+        model.watchEntryId = addSessionEntry(model, entry)
         model.watchKind = "files"
-        model.watchEntryId = entry.id
     elseif value.error == "clipboardTooLarge" then
         toast(model, l10n.tr("lua_widget.clipboard.toast_too_long"))
     elseif value.error then

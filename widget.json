@@ -240,6 +240,7 @@
   ],
   "optionalFeatures": [
     "data.clipboard.changes.image",
+    "clipboard.imageIdentity",
     "interaction.accessibility.metadata",
     "draw.textInkMetrics",
     "control.textInput"
