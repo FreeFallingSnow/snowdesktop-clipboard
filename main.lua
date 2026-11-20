@@ -3,10 +3,8 @@
 -- The clipboard subscription records text, file names and image thumbnails.
 -- The refresh button uses a trusted gesture to read the current clipboard.
 --
--- Image and file entries are read-only and session-bound: the host returns
--- instance-bound handles/references on a click; the RGB thumbnail and
--- display names are not host handles. Neither kind can be persisted or written
--- back by this widget.
+-- Image and file entries are session-bound. Images with a usable host handle
+-- can be copied back. Thumbnails and file names remain available for browsing.
 
 local clipboard = module.require("modules/clipboard.lua")
 local historyStorage = module.require("modules/storage.lua")
@@ -21,6 +19,7 @@ local MAX_STORED_TEXT = clipboard.MAX_STORED_TEXT
 local TOOLTIPS = widget.hasFeature("interaction.tooltip")
 local SEMANTIC_METADATA = widget.hasFeature("interaction.accessibility.metadata")
 local SEARCH_INPUT = widget.hasFeature("control.textInput")
+local WATCH_IMAGE = widget.hasFeature("data.clipboard.changes.image")
 local HEADER_BG_HOVER = 0.10
 local HEADER_BG_ACTIVE = 0.16
 
@@ -301,8 +300,9 @@ end
 local function addSessionEntry(model, entry)
     local sorted, dropped
     if entry.refreshId then
-        sorted = clipboard.enrichSession(model.history, entry.refreshId, entry)
-        if not sorted then
+        local enriched
+        sorted, enriched = clipboard.enrichSession(model.history, entry.refreshId, entry)
+        if not enriched then
             entry.refreshId = nil
             sorted, dropped = clipboard.upsert(model.history, entry, model.cfg.maxCount)
         else
@@ -490,6 +490,13 @@ refreshClipboard = function(model, preferred)
     readClipboard(model, format, batch, model.watchEntryId)
 end
 
+local function canCopyEntry(entry)
+    if entry.kind == "text" then return (entry.text or "") ~= "" end
+    if entry.kind ~= "image" or not entry.image then return false end
+    local status = resource.status(entry.image)
+    return status ~= nil and status.state == "ready"
+end
+
 local function copyEntry(model, id)
     local entry = nil
     for index = 1, #model.history do
@@ -498,20 +505,17 @@ local function copyEntry(model, id)
             break
         end
     end
-    if not entry then return end
-    if hasPending(model, "write") then return end
-    if entry.kind ~= "text" then
-        toast(model, l10n.tr("lua_widget.clipboard.toast_text_only"))
+    if not entry or hasPending(model, "write") then return end
+    if not canCopyEntry(entry) then
+        if entry.kind == "image" then
+            toast(model, l10n.tr("lua_widget.clipboard.toast_image_unavailable"))
+        end
         return
     end
-    if (entry.text or "") == "" then
-        toast(model, l10n.tr("lua_widget.clipboard.toast_write_failed"))
-        return
-    end
-    local taskId = task.start("clipboard.write", {
-        format = "text",
-        text = entry.text or "",
-    })
+    local arguments = entry.kind == "image"
+        and { format = "image", image = entry.image }
+        or { format = "text", text = entry.text }
+    local taskId = task.start("clipboard.write", arguments)
     if not taskId then
         toast(model, l10n.tr("lua_widget.clipboard.toast_write_failed"))
         return
@@ -967,7 +971,7 @@ entryMatches = function(entry, query, zh)
     return string.find(haystack, query, 1, true) ~= nil
 end
 
-local function rowMeta(entry, zh, now, nowParts)
+local function rowMeta(entry, zh, now, nowParts, copyable)
     local timeText = clipboard.relativeTime(entry.ts, now, zh,
         entryParts(entry), nowParts)
     local sizeText
@@ -977,8 +981,7 @@ local function rowMeta(entry, zh, now, nowParts)
         sizeText = l10n.tr("lua_widget.clipboard.meta_chars",
             clipboard.charCount(entry.text))
     elseif entry.kind == "image" then
-        sizeText = entry.image and l10n.tr("lua_widget.clipboard.meta_image",
-            entry.width or 0, entry.height or 0)
+        sizeText = copyable and l10n.tr("lua_widget.clipboard.meta_image_session")
             or l10n.tr("lua_widget.clipboard.meta_thumbnail")
     else
         local count = entry.names and #entry.names or 0
@@ -1021,13 +1024,18 @@ local function drawRow(f, entry, x, width, y, now, zh, nowParts)
         entry.pinned and 0.55 or (hovered and 0.22 or 0.16))
 
     local glyphKind = entry.kind
+    local copyable = canCopyEntry(entry)
     if glyphKind == "text" then glyphKind = clipboard.kindOfEntry(entry) end
     local tint = foregroundColor(TYPE_COLORS[glyphKind] or TYPE_COLORS.text, f.c.light)
     local tile = f.compact and 30 or 34
     local tileX = x + (f.compact and 9 or 12)
     local tileY = y + (height - tile) / 2
-    if entry.kind == "image" and entry.image then
-        local ok = pcall(draw.image, entry.image, tileX, tileY, tile, tile, 0.98)
+    if entry.kind == "image" and copyable then
+        local imageScale = tile / math.max(entry.width, entry.height)
+        local imageWidth, imageHeight = entry.width * imageScale, entry.height * imageScale
+        local ok = pcall(draw.image, entry.image,
+            tileX + (tile - imageWidth) / 2, tileY + (tile - imageHeight) / 2,
+            imageWidth, imageHeight, 0.98)
         if not ok then
             draw.rect(tileX, tileY, tile, tile, tint, 8, 0.10)
             drawGlyph("image", tileX + tile / 2, tileY + tile / 2,
@@ -1072,7 +1080,7 @@ local function drawRow(f, entry, x, width, y, now, zh, nowParts)
         }
         entry._titleFit = titleCache
     end
-    local metaText = rowMeta(entry, zh, now, nowParts)
+    local metaText = rowMeta(entry, zh, now, nowParts, copyable)
     local metaKey = tostring(f.rowMetaFont) .. "\1" .. tostring(titleMax)
         .. "\1" .. metaText
     local metaCache = entry._metaFit
@@ -1106,7 +1114,7 @@ local function drawRow(f, entry, x, width, y, now, zh, nowParts)
     end
 
     local actionY = y + (height - actionSize) / 2
-    if entry.kind == "text" then
+    if copyable then
         local copied = f.model ~= nil and f.model.copiedId == entry.id
         drawRowAction("copy." .. entry.id, actionsX, actionY, actionSize,
             "copy", copied and f.c.accent or f.c.muted,
@@ -1120,7 +1128,7 @@ local function drawRow(f, entry, x, width, y, now, zh, nowParts)
         actionY, actionSize, "delete", f.c.muted,
         l10n.tr("lua_widget.clipboard.menu_delete"),
         l10n.tr("lua_widget.clipboard.menu_delete_hint"), entry.id)
-    if entry.pinned and entry.kind == "text" then
+    if entry.pinned and copyable then
         drawGlyph("pin", x + 6, y + 7, 9, f.c.accent)
     end
 
@@ -1133,14 +1141,14 @@ local function drawRow(f, entry, x, width, y, now, zh, nowParts)
             shape = { type = "roundedRect", x = x, y = regionTop,
                 width = math.max(1, actionsX - x), height = regionBottom - regionTop,
                 radius = ROW_RADIUS },
-            cursor = entry.kind == "text" and "hand" or "default",
+            cursor = copyable and "hand" or "default",
             events = {
-                click = { id = "entry.copy", value = entry.id },
+                click = copyable and { id = "entry.copy", value = entry.id } or nil,
                 contextMenu = { id = "entry.menu", value = entry.id },
             },
             accessibility = {
-                role = entry.kind == "text" and "button" or "listitem",
-                label = entry.kind == "text" and label or
+                role = copyable and "button" or "listitem",
+                label = copyable and label or
                     (label .. " · " .. l10n.tr("lua_widget.clipboard.meta_read_only")),
                 hint = l10n.tr("lua_widget.clipboard.menu_pin_hint"),
                 value = SEMANTIC_METADATA and metaText or nil,
@@ -1419,7 +1427,7 @@ local function menu(_context, model, _request)
             {
                 id = "entry.copy:" .. id,
                 label = l10n.tr("lua_widget.clipboard.menu_copy"),
-                enabled = entry.kind == "text",
+                enabled = canCopyEntry(entry),
                 icon = GLYPHS.copy, iconFont = "fluent",
             },
             {
@@ -1559,7 +1567,9 @@ local function handleTask(model, value)
                 and l10n.tr("lua_widget.clipboard.toast_read_failed")
                 or l10n.tr("lua_widget.clipboard.toast_read_error"))
         else
-            toast(model, l10n.tr("lua_widget.clipboard.toast_write_failed"))
+            toast(model, l10n.tr(err == "clipboardImageUnavailable"
+                and "lua_widget.clipboard.toast_image_unavailable"
+                or "lua_widget.clipboard.toast_write_failed"))
         end
         widget.log("warn", "clipboard " .. job.kind .. ": " .. err)
         if batch then finishCapture(model, batch)
@@ -1632,11 +1642,14 @@ local function onClipboardChange(model, value)
     elseif value.format == "image" and model.cfg.captureImages then
         local pixels = thumbnail.decode(value.rgb, value.width, value.height)
         if not pixels then return end
+        local image = WATCH_IMAGE and value.image or nil
         local now = time.now()
         local entry = {
             id = nextId(model, now), ts = now, pinned = false,
-            kind = "image", imageData = value.rgb,
-            pixels = pixels, width = pixels.width, height = pixels.height,
+            kind = "image", image = image, imageData = value.rgb,
+            pixels = pixels,
+            width = image and value.imageWidth or pixels.width,
+            height = image and value.imageHeight or pixels.height,
         }
         addSessionEntry(model, entry)
         model.watchKind = "image"
