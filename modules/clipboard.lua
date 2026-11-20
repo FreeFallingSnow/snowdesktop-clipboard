@@ -278,11 +278,19 @@ function clipboard.filtered(list, filter)
         local item = list[index]
         local matches = item.kind == filter
         if item.kind == "text" and (filter == "link" or filter == "code") then
-            matches = clipboard.kindOf(item.text) == filter
+            matches = clipboard.kindOfEntry(item) == filter
         end
         if matches then result[#result + 1] = item end
     end
     return result
+end
+
+-- Per-entry cached classification. A text body never mutates on an existing
+-- entry (upsert creates a new table), so the kindOf scan runs once per entry
+-- instead of once per frame in filtered() and row tiles.
+function clipboard.kindOfEntry(item)
+    if item._kind == nil then item._kind = clipboard.kindOf(item.text) end
+    return item._kind
 end
 
 -- Collapse duplicate text entries that share a text body but carry different

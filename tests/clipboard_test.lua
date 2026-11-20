@@ -262,6 +262,46 @@ return {
         same(pinnedFiles.names[1], "a.txt", "file display name retained")
     end,
 
+    ["classifies entries once and filters through the cache"] = function()
+        local item = entry("k", 100, false, "local x = 1")
+        same(clipboard.kindOfEntry(item), "code", "first classify")
+        same(clipboard.kindOfEntry(item), "code", "cached classify")
+        truthy(item._kind == "code", "cache stored on entry")
+        local link = entry("u", 100, false, "https://a.test")
+        clipboard.kindOfEntry(link)
+        local list = {
+            entry("a", 100, false, "plain"),
+            link,
+            item,
+            { id = "f", ts = 200, pinned = false, kind = "files",
+                names = { "a.txt" } },
+        }
+        same(#clipboard.filtered(list, "link"), 1, "link filter")
+        same(clipboard.filtered(list, "link")[1].id, "u", "link row")
+        same(#clipboard.filtered(list, "code"), 1, "code filter")
+        same(clipboard.filtered(list, "code")[1].id, "k", "code row")
+        same(#clipboard.filtered(list, "text"), 3,
+            "text tab matches every text-kind row")
+        same(#clipboard.filtered(list, "files"), 1, "files filter")
+    end,
+
+    ["prunes correctly at a 200-entry cap"] = function()
+        local list = {}
+        for index = 1, 200 do
+            list[index] = entry("id" .. index, index, false, "text" .. index)
+        end
+        local kept, dropped = clipboard.upsert(list,
+            entry("new", 201, false, "new"), 200)
+        same(#kept, 200, "cap held at 200")
+        same(#dropped, 1, "one dropped")
+        same(kept[1].id, "new", "newest first")
+        same(kept[2].id, "id200", "previous newest second")
+        local shrunk, pruned = clipboard.upsert(kept, nil, 10)
+        same(#shrunk, 10, "shrink to 10")
+        same(#pruned, 190, "all excess reported for storage removal")
+        same(shrunk[1].id, "new", "newest survives shrink")
+    end,
+
     ["filters and counts"] = function()
         local list = {
             entry("a", 100, false, "a"),

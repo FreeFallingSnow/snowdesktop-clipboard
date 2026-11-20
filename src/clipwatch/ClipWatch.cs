@@ -12,6 +12,12 @@ using System.Threading;
 // widget. It emits text, bounded image thumbnails and display-only file names
 // over native protocol v1. It never sends paths, writes files or changes the
 // clipboard. Full host image handles and file references still require a click.
+//
+// A message-only window with AddClipboardFormatListener was tried (2026-11-20)
+// and rejected on evidence: under the host's helper environment the listener
+// never fires (standalone runs of the same binary work, the helper's startup
+// capture still reaches the widget, yet no update event is ever delivered),
+// so the watcher keeps the proven sequence-number polling loop.
 internal static class ClipWatch
 {
     private const uint CF_BITMAP = 2;
@@ -20,8 +26,10 @@ internal static class ClipWatch
     private const uint CF_HDROP = 15;
     private const uint CF_DIBV5 = 17;
     private const int MaxTextBytes = 12000; // keep frames under the 16 KiB cap
-    private const int ThumbSize = 24;
+    private const int ThumbSize = 32;
     private const int MaxImageDimension = 16384;
+    private const int PollMilliseconds = 300;
+    private const int HeartbeatPolls = 33; // ~10 s between heartbeats
 
     // These are conventions, not access control: only cooperative clipboard
     // managers and Windows' own history/cloud sync honor them.
@@ -66,6 +74,7 @@ internal static class ClipWatch
     private static readonly object WriteLock = new object();
     private static volatile bool requested;
     private static volatile bool stopped;
+    private static uint lastSeq;
 
     private static void Emit(string json)
     {
@@ -338,8 +347,15 @@ internal static class ClipWatch
         try
         {
             // One clipboard lock gives a consistent snapshot and lets the
-            // privacy check run before any payload is read.
+            // privacy check run before any payload is read. A listener event
+            // can arrive while the source application still holds the board,
+            // so a failed open retries briefly instead of dropping the change.
             opened = OpenClipboard(IntPtr.Zero);
+            for (int attempt = 0; !opened && attempt < 3; attempt++)
+            {
+                Thread.Sleep(15);
+                opened = OpenClipboard(IntPtr.Zero);
+            }
             if (!opened)
             {
                 EmitCaptureError();
@@ -418,6 +434,14 @@ internal static class ClipWatch
             + "{\"captureError\":\"clipboardReadFailed\"}}");
     }
 
+    private static void CheckClipboard()
+    {
+        uint seq = GetClipboardSequenceNumber();
+        if (seq == 0 || seq == lastSeq) return;
+        lastSeq = seq;
+        EmitCapture();
+    }
+
     private static void ReadInput(Stream input)
     {
         byte[] buffer = new byte[4096];
@@ -476,20 +500,15 @@ internal static class ClipWatch
             Thread.Sleep(50);
         if (!requested || stopped) return 0;
 
-        uint last = GetClipboardSequenceNumber();
+        lastSeq = GetClipboardSequenceNumber();
         EmitCapture();
         int ticks = 0;
         while (!stopped)
         {
-            Thread.Sleep(300);
-            uint seq = GetClipboardSequenceNumber();
-            if (seq != last && seq != 0)
-            {
-                last = seq;
-                EmitCapture();
-            }
+            Thread.Sleep(PollMilliseconds);
+            CheckClipboard();
             ticks++;
-            if (ticks % 33 == 0)
+            if (ticks % HeartbeatPolls == 0)
                 Emit("{\"version\":1,\"kind\":\"heartbeat\",\"id\":\"1\"}");
         }
         return 0;

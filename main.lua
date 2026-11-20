@@ -26,6 +26,7 @@ local MAX_STORED_TEXT = clipboard.MAX_STORED_TEXT
 local WATCH_HELPER = "clipwatch"
 local TOOLTIPS = widget.hasFeature("interaction.tooltip")
 local SEMANTIC_METADATA = widget.hasFeature("interaction.accessibility.metadata")
+local SEARCH_INPUT = widget.hasFeature("control.textInput")
 local HEADER_BG_HOVER = 0.10
 local HEADER_BG_ACTIVE = 0.16
 
@@ -80,7 +81,7 @@ local settings = {
             description = l10n.tr("lua_widget.clipboard.settings_max_desc"),
             type = "select",
             default = "20",
-            options = { "10", "20", "30", "50" },
+            options = { "10", "20", "30", "50", "100", "150", "200" },
         },
         {
             key = "captureImages",
@@ -100,15 +101,20 @@ local settings = {
 }
 
 local FILTERS = { "all", "text", "image", "files" }
+local MENU_FILTERS = { "all", "text", "link", "code", "image", "files" }
 local FILTER_KEYS = {
     all = "lua_widget.clipboard.menu_all",
     text = "lua_widget.clipboard.menu_text",
+    link = "lua_widget.clipboard.menu_link",
+    code = "lua_widget.clipboard.menu_code",
     image = "lua_widget.clipboard.menu_image",
     files = "lua_widget.clipboard.menu_files",
 }
 local FILTER_TOOLTIPS = {
     all = "lua_widget.clipboard.menu_filter_all",
     text = "lua_widget.clipboard.menu_filter_text",
+    link = "lua_widget.clipboard.menu_filter_link",
+    code = "lua_widget.clipboard.menu_filter_code",
     image = "lua_widget.clipboard.menu_filter_image",
     files = "lua_widget.clipboard.menu_filter_files",
 }
@@ -126,7 +132,7 @@ local function config()
     if not FILTER_KEYS[tostring(filter or "")] then filter = "all" end
     local maxCount = tonumber(storage.get("maxCount")) or 20
     return {
-        maxCount = math.max(10, math.min(50, maxCount)),
+        maxCount = math.max(10, math.min(200, maxCount)),
         autoWatch = isOn("autoWatch", true),
         captureImages = isOn("captureImages", true),
         captureFiles = isOn("captureFiles", true),
@@ -140,8 +146,7 @@ end
 
 -- contentTheme is the resolved foreground, not a guess based on wallpaper or
 -- background RGB: 1 = dark ink, 0 = light ink. All card fills derive from it.
-local function palette()
-    local snapshot = widget.theme() or {}
+local function palette(snapshot)
     local light = snapshot.contentTheme == 1
     local accent = snapshot.accentColor or ACCENT
     -- Keep the filter readable on system accent colors with a light foreground.
@@ -154,6 +159,19 @@ local function palette()
         accentInk = brightness > 165 and 0x1C1C1E or 0xFFFFFF,
         light = light,
     }
+end
+
+-- Resolved palette cached per theme signature; the snapshot table is cheap to
+-- read every frame, the derived palette is not rebuilt while it is stable.
+local function paletteCached(model)
+    local snapshot = widget.theme() or {}
+    local sig = tostring(snapshot.contentTheme) .. "\1"
+        .. tostring(snapshot.accentColor)
+    local cached = model._palette
+    if cached and cached.sig == sig then return cached.value end
+    local value = palette(snapshot)
+    model._palette = { sig = sig, value = value }
+    return value
 end
 
 -- Text helpers -------------------------------------------------------------
@@ -186,17 +204,21 @@ end
 
 local storageError
 
--- Bulk deletes cost one storage write through a transaction; the host's burst
--- budget is 32 writes, so clearing 50 entries or cleaning duplicates one
--- remove() at a time could throw mid-way. Fall back per key on old hosts.
+-- Bulk deletes run through transactions in batches of 50 keys: 1.0.2 proved
+-- transactions of that size live, and 4-5 transactions stay far inside the
+-- host's 32-write burst budget even when clearing a 200-entry history.
+-- minHostVersion 1.0.16 guarantees storage.transaction, so there is no
+-- per-key fallback.
 local function removeKeys(keys)
     if #keys == 0 then return true end
-    if widget.hasFeature("storage.transaction") then
-        return pcall(historyStorage.removeDropped, storage.transaction, keys)
-    end
-    for index = 1, #keys do
-        local ok = pcall(storage.remove, keys[index])
-        if not ok then return false end
+    for start = 1, #keys, 50 do
+        local batch = {}
+        for index = start, math.min(start + 49, #keys) do
+            batch[#batch + 1] = keys[index]
+        end
+        if not pcall(historyStorage.removeDropped, storage.transaction, batch) then
+            return false
+        end
     end
     return true
 end
@@ -242,6 +264,25 @@ end
 local function nextId(model, now)
     model.seq = (model.seq or 0) + 1
     return string.format("%d-%d", now, model.seq)
+end
+
+local function isQuotaError(err)
+    return tostring(err or ""):find("quota", 1, true) ~= nil
+end
+
+-- Oldest unpinned persisted entries, for quota eviction. Pins sort first, so
+-- the unpinned tail is scanned from the end; session-only kinds have no key.
+local function evictOldestStored(list, excludeId, max)
+    local evicted = {}
+    for index = #list, 1, -1 do
+        if #evicted >= max then break end
+        local entry = list[index]
+        if entry.kind == "text" and not entry.pinned
+            and entry.id ~= excludeId then
+            evicted[#evicted + 1] = entry.id
+        end
+    end
+    return evicted
 end
 
 local function hasPending(model, kind)
@@ -299,6 +340,23 @@ local function addTextEntry(model, text)
         -- the old entry deleted while the new one exists only in memory.
         local ok, err = pcall(historyStorage.write, storage.transaction,
             item, dropped, clipboard.encode)
+        if not ok and isQuotaError(err) then
+            -- Storage full: evict the oldest unpinned entries and retry once
+            -- before degrading to a session-only entry.
+            local evicted = evictOldestStored(model.history, item.id, 8)
+            if #evicted > 0 then
+                local merged = {}
+                for index = 1, #dropped do merged[#merged + 1] = dropped[index] end
+                for index = 1, #evicted do merged[#merged + 1] = evicted[index] end
+                ok, err = pcall(historyStorage.write, storage.transaction,
+                    item, merged, clipboard.encode)
+                if ok then
+                    for index = 1, #evicted do
+                        sorted = clipboard.removeId(sorted, evicted[index])
+                    end
+                end
+            end
+        end
         if not ok then
             storageError(model, err)
             item.sessionOnly = true
@@ -336,6 +394,9 @@ end
 
 -- Native clipboard watcher -------------------------------------------------
 
+local scheduleWatchRetry  -- defined below; retries helper startup with backoff
+local WATCH_RETRY_MAX = 5
+
 local function startWatch(model)
     if model.watchId or not model.cfg.autoWatch then return end
     if model.preview or not widget.hasFeature("task.native.watch") then return end
@@ -348,8 +409,10 @@ local function startWatch(model)
     if taskId then
         model.watchId = taskId
         model.watchError = nil
+        model.watchAttempts = 0
     else
         model.watchError = tostring(err)
+        scheduleWatchRetry(model)
     end
 end
 
@@ -359,7 +422,19 @@ local function stopWatch(model)
     model.watchId = nil
 end
 
+-- Exponential backoff for a helper that failed to start or exited; stops
+-- after WATCH_RETRY_MAX tries and stays in manual mode until the user acts.
+scheduleWatchRetry = function(model)
+    if model.preview or not model.cfg.autoWatch then return end
+    model.watchAttempts = (model.watchAttempts or 0) + 1
+    if model.watchAttempts > WATCH_RETRY_MAX then return end
+    local delay = math.min(30000, 2000 * (2 ^ (model.watchAttempts - 1)))
+    schedule.after("watchRetry", math.floor(delay + 0.5))
+end
+
 -- Clipboard tasks ----------------------------------------------------------
+
+local refreshClipboard  -- defined below; a queued click re-enters after capture
 
 local function finishCapture(model, batch)
     if model.captureGeneration ~= batch.generation or model.captureBatch ~= batch then
@@ -368,9 +443,19 @@ local function finishCapture(model, batch)
     model.captureActive = false
     model.captureBatch = nil
     widget.invalidate()
+    -- A click during an active capture is queued instead of dropped.
+    if model.pendingRefresh ~= nil then
+        local preferred = model.pendingRefresh
+        model.pendingRefresh = nil
+        if preferred ~= true then
+            refreshClipboard(model, preferred)
+        else
+            refreshClipboard(model)
+        end
+    end
 end
 
-local function readClipboard(model, format, batch)
+local function readClipboard(model, format, batch, refreshId)
     if not batch or model.captureGeneration ~= batch.generation then return end
     local taskId, err = task.start("clipboard.read", { format = format })
     if not taskId then
@@ -379,9 +464,11 @@ local function readClipboard(model, format, batch)
         finishCapture(model, batch)
         return
     end
+    -- The watched row id rides on the task: an explicit refresh may enrich
+    -- that exact row with a host handle/reference (id and kind must match).
     model.tasks[taskId] = {
         kind = "read", format = format, generation = batch.generation,
-        refreshId = not preferred and model.watchEntryId or nil,
+        refreshId = refreshId or nil,
     }
     widget.invalidate()
 end
@@ -389,8 +476,11 @@ end
 -- A scheduled callback is NOT a trusted gesture. Read the type just observed
 -- by the watcher in one host task; without the helper, explicit type actions
 -- remain available in the refresh button's context menu.
-local function refreshClipboard(model, preferred)
-    if model.captureActive or hasPending(model, "read") then return end
+refreshClipboard = function(model, preferred)
+    if model.captureActive or hasPending(model, "read") then
+        model.pendingRefresh = preferred or true
+        return
+    end
     local format = preferred or model.watchKind or "text"
     if format == "files" then format = "file-reference" end
     if format == "image" and not model.cfg.captureImages then format = "text" end
@@ -403,7 +493,7 @@ local function refreshClipboard(model, preferred)
     local batch = { generation = model.captureGeneration, captured = 0 }
     model.captureActive = true
     model.captureBatch = batch
-    readClipboard(model, format, batch)
+    readClipboard(model, format, batch, model.watchEntryId)
 end
 
 local function copyEntry(model, id)
@@ -432,7 +522,7 @@ local function copyEntry(model, id)
         toast(model, l10n.tr("lua_widget.clipboard.toast_write_failed"))
         return
     end
-    model.tasks[taskId] = { kind = "write" }
+    model.tasks[taskId] = { kind = "write", entryId = id }
     widget.invalidate()
 end
 
@@ -467,15 +557,21 @@ local function pinEntry(model, id)
         end
     end
     if not entry then return end
+    -- One toggle over the full list; the updated row is the persistence target.
+    local updated = clipboard.togglePin(model.history, id, time.now())
     if entry.kind == "text" and #entry.text <= MAX_STORED_TEXT then
-        local updated = clipboard.togglePin({ entry }, id, time.now())[1]
-        local ok, err = pcall(persistEntry, updated)
+        local item
+        for index = 1, #updated do
+            if updated[index].id == id then item = updated[index] break end
+        end
+        if not item then return end
+        local ok, err = pcall(persistEntry, item)
         if not ok then
             storageError(model, err)
             return
         end
     end
-    model.history = clipboard.togglePin(model.history, id, time.now())
+    model.history = updated
     widget.invalidate()
 end
 
@@ -507,6 +603,8 @@ end
 
 -- Geometry -----------------------------------------------------------------
 
+local entryMatches  -- defined with the row helpers below
+
 local function buildFrame(model)
     local width = layout.contentWidth()
     local height = layout.contentHeight()
@@ -518,10 +616,27 @@ local function buildFrame(model)
     local padY = compact and 12 or 18
     local headerHeight = compact and 28 or 32
     local filterHeight = compact and 28 or 32
+    local searchOpen = SEARCH_INPUT and model.searchOpen == true
+        and height >= 180
+    local searchHeight = searchOpen and (compact and 26 or 30) or 0
+    local searchTop = padY + headerHeight + 10 + filterHeight + 6
     local bodyTop = padY + headerHeight + 10 + filterHeight + 14
+    if searchOpen then bodyTop = searchTop + searchHeight + 10 end
     local bodyBottom = height - padY
     local rowHeight = compact and 62 or 76
     local rows = clipboard.filtered(model.history, cfg.filter)
+    local query = searchOpen
+        and string.lower(tostring(model.searchQuery or "")) or ""
+    if query ~= "" then
+        local zh = isZh()
+        local matched = {}
+        for index = 1, #rows do
+            if entryMatches(rows[index], query, zh) then
+                matched[#matched + 1] = rows[index]
+            end
+        end
+        rows = matched
+    end
     local columns = width >= 420 and 2 or 1
     local gap = columns > 1 and 12 or 0
     local cellWidth = ((width - padX * 2) - gap * (columns - 1)) / columns
@@ -531,6 +646,8 @@ local function buildFrame(model)
         left = padX, right = width - padX, top = padY,
         headerHeight = headerHeight, filterHeight = filterHeight,
         filterTop = padY + headerHeight + 10,
+        searchOpen = searchOpen, searchTop = searchTop,
+        searchHeight = searchHeight,
         bodyTop = bodyTop, bodyBottom = bodyBottom,
         bodyHeight = math.max(1, bodyBottom - bodyTop),
         rowHeight = rowHeight,
@@ -540,7 +657,8 @@ local function buildFrame(model)
         total = #model.history,
         cfg = cfg,
         compact = compact,
-        c = palette(),
+        model = model,
+        c = paletteCached(model),
         titleFont = compact and 15 or 18,
         metaFont = compact and 10 or 11,
         rowTitleFont = compact and 11 or 13,
@@ -685,6 +803,24 @@ local function drawChevron(cx, cy, size, color, alpha)
         1.3, color, alpha)
 end
 
+local function drawSearchGlyph(cx, cy, size, color, alpha)
+    -- Lens ring in two arcs plus a handle at forty-five degrees.
+    draw.arc(cx, cy, size * 0.30, 0, 180, 1.5, color, alpha)
+    draw.arc(cx, cy, size * 0.30, 180, 180, 1.5, color, alpha)
+    draw.line(cx + size * 0.21, cy + size * 0.21,
+        cx + size * 0.44, cy + size * 0.44, 1.6, color, alpha)
+end
+
+-- The header title only changes with card size; keep it off the measure path.
+local function headerTitle(model, font, room)
+    local key = tostring(font) .. "\1" .. tostring(room)
+    local cache = model._headerTitle
+    if cache and cache.key == key then return cache.value end
+    local value = ellipsize(l10n.tr("lua_widget.clipboard.name"), font, room, true)
+    model._headerTitle = { key = key, value = value }
+    return value
+end
+
 local function drawHeader(f, model)
     local ink = f.c.ink
     local cy = f.top + f.headerHeight / 2
@@ -693,11 +829,53 @@ local function drawHeader(f, model)
     local captureX = f.right - buttonSize
     local clearX = captureX - gap - buttonSize
     local filterX = clearX - gap - buttonSize
-    local titleRoom = filterX - 12 - f.left
-    local title = ellipsize(l10n.tr("lua_widget.clipboard.name"),
-        f.titleFont, titleRoom, true)
+    local searchX = SEARCH_INPUT and (filterX - gap - buttonSize) or nil
+    local titleRoom = (searchX or filterX) - 12 - f.left
+    local title = headerTitle(model, f.titleFont, titleRoom)
     draw.text(f.left, cy - f.titleFont / 2, title, f.titleFont, ink,
         titleRoom, true, true, 0, 0.97)
+
+    -- Amber dot while the native helper is down; click retries immediately.
+    if model.cfg.autoWatch and model.watchError and not model.watchId then
+        local badgeX = f.left + textWidth(title, f.titleFont, true) + 10
+        draw.circle(badgeX, cy, 3.2, 0xE8B467, 0.95)
+        interaction.region({
+            key = "watch.badge",
+            shape = { type = "roundedRect", x = badgeX - 5, y = cy - 7,
+                width = 11, height = 14, radius = 5 },
+            cursor = "default",
+            events = { click = { id = "watch.retry" } },
+            tooltip = TOOLTIPS and
+                l10n.tr("lua_widget.clipboard.badge_watch_offline") or nil,
+            accessibility = { role = "text",
+                label = l10n.tr("lua_widget.clipboard.badge_watch_offline") },
+        })
+    end
+
+    if SEARCH_INPUT and searchX then
+        local searchKey = "search.toggle"
+        local searchActive = f.searchOpen == true
+        local searchHovered = interaction.isHovered(searchKey)
+        draw.rect(searchX, cy - buttonSize / 2, buttonSize, buttonSize,
+            searchActive and f.c.accent or ink, 7,
+            searchActive and HEADER_BG_ACTIVE
+                or (searchHovered and HEADER_BG_HOVER or 0))
+        drawSearchGlyph(searchX + buttonSize / 2, cy, 14,
+            searchActive and f.c.accent or ink, 0.65)
+        local searchRegion = {
+            key = searchKey,
+            shape = { type = "roundedRect", x = searchX, y = cy - buttonSize / 2,
+                width = buttonSize, height = buttonSize, radius = 7 },
+            cursor = "hand",
+            events = { click = { id = "search.toggle" } },
+            accessibility = { role = "button",
+                label = l10n.tr("lua_widget.clipboard.menu_search") },
+        }
+        if TOOLTIPS then
+            searchRegion.tooltip = l10n.tr("lua_widget.clipboard.search_hint")
+        end
+        interaction.region(searchRegion)
+    end
 
     local filterKey = "filter"
     local hovered = interaction.isHovered(filterKey)
@@ -753,8 +931,9 @@ local function drawHeader(f, model)
     local pressed = interaction.isPressed(captureKey)
     draw.rect(captureX, cy - buttonSize / 2, buttonSize, buttonSize,
         ink, 7, pressed and HEADER_BG_ACTIVE
-            or (hovered and HEADER_BG_HOVER or 0))
-    drawRefresh(captureX + buttonSize / 2, cy, 17, f.c.accent, 0.92)
+            or ((hovered or model.captureActive) and HEADER_BG_HOVER or 0))
+    drawRefresh(captureX + buttonSize / 2, cy, 17, f.c.accent,
+        model.captureActive and 0.45 or 0.92)
     local captureRegion = {
         key = captureKey,
         shape = { type = "roundedRect", x = captureX, y = cy - buttonSize / 2,
@@ -838,6 +1017,15 @@ end
 
 -- Rows ---------------------------------------------------------------------
 
+-- Calendar parts are stable per timestamp; relativeTime reads them once.
+local function entryParts(entry)
+    if entry._partsAt ~= entry.ts then
+        entry._partsAt = entry.ts
+        entry._parts = time.parts(entry.ts)
+    end
+    return entry._parts
+end
+
 local function rowTitle(entry, zh)
     if entry.kind == "image" then
         if entry.image then
@@ -853,9 +1041,48 @@ local function rowTitle(entry, zh)
     return clipboard.preview(entry.text, 320)
 end
 
+-- Cached row title. The text branch runs a full-text gsub per call, so it is
+-- memoized behind a content signature; underscore fields never reach storage
+-- (encode reads ts/pinned/text only) and are copied with the entry by pin.
+local function rowTitleCached(entry, zh)
+    local sig
+    if entry.kind == "image" then
+        sig = (entry.image and "i" or "p") .. tostring(entry.width or 0)
+            .. "x" .. tostring(entry.height or 0)
+    elseif entry.kind == "files" then
+        sig = tostring(entry.names and #entry.names or 0) .. "\1"
+            .. tostring(entry.names and entry.names[1] or "")
+    else
+        sig = "t"
+    end
+    local key = (zh and "zh" or "en") .. "\1" .. sig
+    if entry._titleAt == key then return entry._title end
+    local value = rowTitle(entry, zh)
+    entry._titleAt, entry._title = key, value
+    return value
+end
+
+-- Full-text search for text entries (cached lowercase, text is immutable per
+-- entry); image and file rows match against their display title.
+local function entrySearchText(entry)
+    if entry.kind ~= "text" then return nil end
+    if entry._searchLower == nil then
+        entry._searchLower = string.lower(entry.text or "")
+    end
+    return entry._searchLower
+end
+
+entryMatches = function(entry, query, zh)
+    local haystack = entrySearchText(entry)
+    if haystack == nil then
+        haystack = string.lower(rowTitleCached(entry, zh))
+    end
+    return string.find(haystack, query, 1, true) ~= nil
+end
+
 local function rowMeta(entry, zh, now, nowParts)
     local timeText = clipboard.relativeTime(entry.ts, now, zh,
-        time.parts(entry.ts), nowParts)
+        entryParts(entry), nowParts)
     local sizeText
     if entry.kind == "text" and entry.sessionOnly then
         sizeText = l10n.tr("lua_widget.clipboard.meta_unsaved")
@@ -911,7 +1138,7 @@ local function drawRow(f, entry, x, width, y, now, zh, nowParts)
         entry.pinned and 0.55 or (hovered and 0.22 or 0.16))
 
     local glyphKind = entry.kind
-    if glyphKind == "text" then glyphKind = clipboard.kindOf(entry.text) end
+    if glyphKind == "text" then glyphKind = clipboard.kindOfEntry(entry) end
     local tint = TYPE_COLORS[glyphKind] or TYPE_COLORS.text
     local tile = f.compact and 30 or 34
     local tileX = x + (f.compact and 9 or 12)
@@ -951,7 +1178,17 @@ local function drawRow(f, entry, x, width, y, now, zh, nowParts)
     local textX = tileX + tile + (f.compact and 8 or 10)
     local titleMax = math.max(0, actionsX - 8 - textX)
     local titleY = y + (height - f.rowTitleFont - f.rowMetaFont - 6) / 2
-    local title = ellipsize(rowTitle(entry, zh), f.rowTitleFont, titleMax, false)
+    local titleText = rowTitleCached(entry, zh)
+    local titleKey = tostring(f.rowTitleFont) .. "\1" .. tostring(titleMax)
+    local titleCache = entry._titleFit
+    local title
+    if titleCache and titleCache.key == titleKey
+        and titleCache.text == titleText then
+        title = titleCache.value
+    else
+        title = ellipsize(titleText, f.rowTitleFont, titleMax, false)
+        entry._titleFit = { key = titleKey, text = titleText, value = title }
+    end
     local code = entry.kind == "text" and glyphKind == "code"
     local codeLines = code and (f.compact and 2 or 3) or 1
     if code then
@@ -966,14 +1203,25 @@ local function drawRow(f, entry, x, width, y, now, zh, nowParts)
     end
     local metaY = code and (y + height - f.rowMetaFont - 8)
         or (titleY + f.rowTitleFont + 6)
-    local meta = ellipsize(rowMeta(entry, zh, now, nowParts), f.rowMetaFont, titleMax, false)
+    local metaText = rowMeta(entry, zh, now, nowParts)
+    local metaKey = tostring(f.rowMetaFont) .. "\1" .. tostring(titleMax)
+        .. "\1" .. metaText
+    local metaCache = entry._metaFit
+    local meta
+    if metaCache and metaCache.key == metaKey then
+        meta = metaCache.value
+    else
+        meta = ellipsize(metaText, f.rowMetaFont, titleMax, false)
+        entry._metaFit = { key = metaKey, value = meta }
+    end
     draw.text(textX, metaY, meta, f.rowMetaFont, ink,
         titleMax, false, true, 0, 0.58)
 
     local actionY = y + (height - actionSize) / 2
     if entry.kind == "text" then
+        local copied = f.model ~= nil and f.model.copiedId == entry.id
         drawRowAction(f, "copy." .. entry.id, actionsX, actionY, actionSize,
-            "copy", ink, hovered and 0.80 or 0.45,
+            "copy", copied and f.c.accent or ink, hovered and 0.80 or 0.45,
             l10n.tr("lua_widget.clipboard.menu_copy"),
             l10n.tr("lua_widget.clipboard.menu_copy_hint"), entry.id)
     elseif entry.pinned then
@@ -991,7 +1239,7 @@ local function drawRow(f, entry, x, width, y, now, zh, nowParts)
     local regionTop = math.max(y, f.bodyTop)
     local regionBottom = math.min(y + height, f.bodyBottom)
     if regionBottom - regionTop > 2 then
-        local label = rowTitle(entry, zh)
+        local label = titleText
         interaction.region({
             key = key,
             shape = { type = "roundedRect", x = x, y = regionTop,
@@ -1007,7 +1255,7 @@ local function drawRow(f, entry, x, width, y, now, zh, nowParts)
                 label = entry.kind == "text" and label or
                     (label .. " · " .. l10n.tr("lua_widget.clipboard.meta_read_only")),
                 hint = l10n.tr("lua_widget.clipboard.menu_pin_hint"),
-                value = SEMANTIC_METADATA and rowMeta(entry, zh, now, nowParts) or nil,
+                value = SEMANTIC_METADATA and metaText or nil,
             },
         })
     end
@@ -1022,19 +1270,25 @@ local function drawEmpty(f, model)
     local hintFont = f.compact and 10 or 11
     local buttonHeight = 28
     local spacing = f.compact and 10 or 16
-    local block = disc + spacing + titleFont + 6 + hintFont + spacing + buttonHeight
+    local searching = f.searchOpen and (model.searchQuery or "") ~= ""
+    local block = disc + spacing + titleFont + 6 + hintFont
+    if not searching then
+        block = block + spacing + buttonHeight
+    end
     local top = f.bodyTop + math.max(0, (f.bodyHeight - block) / 2)
     local discTop = math.max(f.bodyTop + 8, top)
     draw.rect(cx - disc / 2, discTop, disc, disc, ink, disc / 2, 0.045)
     drawClipboardGlyph(cx, discTop + disc / 2, disc * 0.48, ink, 0.32)
-    local titleKey = filter == "all" and "lua_widget.clipboard.empty_title"
-        or "lua_widget.clipboard.empty_filter"
+    local titleKey = searching and "lua_widget.clipboard.search_empty_title"
+        or (filter == "all" and "lua_widget.clipboard.empty_title"
+        or "lua_widget.clipboard.empty_filter")
     local title = l10n.tr(titleKey)
     draw.text(cx - textWidth(title, titleFont, false) / 2,
         top + disc + spacing, title, titleFont, ink, 0, false, true, 0, 0.78)
-    local hintKey = filter ~= "all" and "lua_widget.clipboard.empty_category_hint"
+    local hintKey = searching and "lua_widget.clipboard.search_empty_hint"
+        or (filter ~= "all" and "lua_widget.clipboard.empty_category_hint"
         or (model.watchId and "lua_widget.clipboard.empty_hint"
-            or "lua_widget.clipboard.empty_hint_manual")
+            or "lua_widget.clipboard.empty_hint_manual"))
     local hintText = ellipsize(l10n.tr(hintKey), hintFont,
         f.right - f.left - 8, false)
     if hintText ~= "" then
@@ -1042,6 +1296,7 @@ local function drawEmpty(f, model)
             top + disc + spacing + titleFont + 6, hintText, hintFont, ink,
             0, false, true, 0, 0.42)
     end
+    if searching then return end
     local actionKey = filter == "image" and "lua_widget.clipboard.menu_capture_image"
         or (filter == "files" and "lua_widget.clipboard.menu_capture_files"
             or "lua_widget.clipboard.empty_action")
@@ -1062,6 +1317,58 @@ local function drawEmpty(f, model)
             click = { id = "capture.refresh" },
             contextMenu = { id = "capture.menu" },
         },
+    })
+end
+
+-- Session search row: the host-owned editor commits a stable descriptor every
+-- render and binds its value to instance storage; clearing on close and at
+-- setup keeps the query session-scoped in practice.
+local function drawSearchRow(f, model)
+    local ink = f.c.ink
+    local y = f.searchTop
+    local height = f.searchHeight
+    -- Close button mirrors the row-action scale: small rounded hit area, a
+    -- compact ✕ glyph, flush with the right edge like the header buttons.
+    local closeSize = math.max(18, height - 4)
+    local glyph = math.floor(closeSize * 0.40)
+    local closeX = f.right - closeSize
+    local inputRight = closeX - 8
+    model.searchQuery = tostring(control.textInput({
+        key = "search",
+        storageKey = "searchQuery",
+        shape = { type = "rect", x = f.left, y = y,
+            width = math.max(40, inputRight - f.left), height = height },
+        placeholder = l10n.tr("lua_widget.clipboard.search_hint"),
+        fontSize = f.compact and 11 or 12,
+        textColor = ink,
+        placeholderColor = f.c.light and 0x8A8A92 or 0x6F7480,
+        backgroundColor = ink,
+        backgroundAlpha = 0.06,
+        focusedBackgroundAlpha = 0.10,
+        borderColor = ink,
+        borderAlpha = 0.14,
+        focusedBorderAlpha = 0.42,
+        radius = 8,
+        liveUpdate = true,
+        maxBytes = 256,
+    }) or "")
+    local cy = y + height / 2
+    local key = "search.close"
+    local hovered = interaction.isHovered(key)
+    draw.rect(closeX, cy - closeSize / 2, closeSize, closeSize, ink, 6,
+        hovered and 0.14 or 0)
+    local gx = closeX + closeSize / 2
+    local half = glyph / 2
+    draw.line(gx - half, cy - half, gx + half, cy + half, 1.6, ink, 0.72)
+    draw.line(gx + half, cy - half, gx - half, cy + half, 1.6, ink, 0.72)
+    interaction.region({
+        key = key,
+        shape = { type = "roundedRect", x = closeX, y = cy - closeSize / 2,
+            width = closeSize, height = closeSize, radius = 6 },
+        cursor = "hand",
+        events = { click = { id = "search.close" } },
+        accessibility = { role = "button",
+            label = l10n.tr("lua_widget.clipboard.menu_close_search") },
     })
 end
 
@@ -1092,6 +1399,7 @@ local function render(_context, model)
 
     drawHeader(f, model)
     drawFilters(f, model)
+    if f.searchOpen then drawSearchRow(f, model) end
     draw.line(f.left, f.bodyTop - 7, f.right, f.bodyTop - 7, 1, f.c.ink, 0.07)
 
     if f.count == 0 then
@@ -1141,8 +1449,14 @@ local function setup(context)
         preview = context.preview == true,
         watchId = nil,
         watchError = nil,
+        watchAttempts = 0,
+        searchOpen = false,
+        searchQuery = "",
+        copiedId = nil,
+        pendingRefresh = nil,
     }
     loadHistory(model)
+    if not model.preview then storage.set("searchQuery", "") end
     if model.preview and #model.history == 0 then
         -- Deterministic fixture for the catalog preview; never persisted.
         local now = time.now()
@@ -1189,8 +1503,8 @@ local function menu(_context, model, _request)
 
     if request.id == "filter.menu" then
         local items = {}
-        for index = 1, #FILTERS do
-            local key = FILTERS[index]
+        for index = 1, #MENU_FILTERS do
+            local key = MENU_FILTERS[index]
             items[#items + 1] = {
                 id = "filter.set:" .. key,
                 value = key,
@@ -1304,6 +1618,23 @@ local function handleAction(model, value)
         end
     elseif id == "clear.click" then
         requestClear(model)
+    elseif id == "search.toggle" then
+        model.searchOpen = not model.searchOpen
+        if not model.searchOpen then
+            model.searchQuery = ""
+            storage.set("searchQuery", "")
+        end
+        widget.invalidate()
+    elseif id == "search.close" then
+        model.searchOpen = false
+        model.searchQuery = ""
+        storage.set("searchQuery", "")
+        widget.invalidate()
+    elseif id == "watch.retry" then
+        model.watchError = nil
+        model.watchAttempts = 0
+        if model.cfg.autoWatch and not model.watchId then startWatch(model) end
+        widget.invalidate()
     elseif id == "watch.toggle" then
         storage.set("autoWatch", model.cfg.autoWatch and "false" or "true")
         model.cfg = config()
@@ -1326,6 +1657,7 @@ local function handleTask(model, value)
         if value.taskId == model.watchId then
             model.watchId = nil
             model.watchError = value.error or "nativeExited"
+            scheduleWatchRetry(model)
             widget.invalidate()
         end
         return
@@ -1337,8 +1669,11 @@ local function handleTask(model, value)
     if not value.ok or type(value.value) ~= "table" then
         local err = tostring(value.error or "readFailed")
         if job.kind == "read" then
+            -- Known host codes map to localized text; the raw code stays in the
+            -- log for diagnosis.
             toast(model, err == "formatUnavailable"
-                and l10n.tr("lua_widget.clipboard.toast_read_failed") or err)
+                and l10n.tr("lua_widget.clipboard.toast_read_failed")
+                or l10n.tr("lua_widget.clipboard.toast_read_error"))
         else
             toast(model, l10n.tr("lua_widget.clipboard.toast_write_failed"))
         end
@@ -1349,6 +1684,13 @@ local function handleTask(model, value)
     end
 
     local result = value.value
+    if job.kind == "write" then
+        model.copiedId = job.entryId
+        schedule.after("copiedMark", 2500)
+        toast(model, l10n.tr("lua_widget.clipboard.toast_copied"))
+        widget.invalidate()
+        return
+    end
     local captured = false
     local now = time.now()
     if job.format == "text" then
@@ -1472,6 +1814,14 @@ local function event(_context, model, value)
         elseif value.id == "captureNext" then
             -- Legacy pending timers are cancelled during setup/dispose.
             model.captureNextAt = nil
+        elseif value.id == "copiedMark" then
+            model.copiedId = nil
+            widget.invalidate()
+        elseif value.id == "watchRetry" then
+            if model.cfg.autoWatch and not model.watchId then
+                startWatch(model)
+                widget.invalidate()
+            end
         end
         return
     end
@@ -1501,9 +1851,12 @@ local function dispose(_context, model)
     schedule.cancel("toast")
     schedule.cancel("clearConfirm")
     schedule.cancel("captureNext")
+    schedule.cancel("copiedMark")
+    schedule.cancel("watchRetry")
     model.captureGeneration = (model.captureGeneration or 0) + 1
     model.captureActive = false
     model.captureBatch = nil
+    model.pendingRefresh = nil
     for taskId in pairs(model.tasks) do
         task.cancel(taskId)
     end
