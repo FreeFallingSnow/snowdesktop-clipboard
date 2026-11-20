@@ -11,7 +11,6 @@ local historyStorage = module.require("modules/storage.lua")
 local thumbnail = module.require("modules/preview.lua")
 
 local ACCENT = 0x6D8DFF
-local ROW_RADIUS = 10
 local TOAST_MS = 2800
 local CONFIRM_MS = 3000
 local MAX_TEXT = clipboard.MAX_TEXT
@@ -633,6 +632,8 @@ local function buildFrame(model)
     local cfg = model.cfg
     local compact = width < 300 or height < 240
     local controlRow = ui.metrics().layoutRowHeight
+    local entryScale = controlRow / 28
+    local entryGap = 6 * entryScale
     local padX = math.max(8, math.min(14, width * 0.045))
     local contentWidth = width - padX * 2
     -- A tall, narrow card still needs room for the title and tab labels.
@@ -645,9 +646,8 @@ local function buildFrame(model)
     local searchTop = filterTop + controlRow + rowGap
     local canSearch = SEARCH_INPUT and height >= searchTop + controlRow * 2 + padY
     local searchOpen = canSearch and model.searchOpen == true
-    local bodyTop = searchTop + (searchOpen and controlRow + rowGap or 0)
+    local bodyTop = (searchOpen and searchTop or filterTop) + controlRow + entryGap
     local bodyBottom = height - padY
-    local rowHeight = compact and 54 or 64
     local rows = clipboard.filtered(model.history, cfg.filter)
     local query = searchOpen
         and string.lower(tostring(model.searchQuery or "")) or ""
@@ -661,8 +661,8 @@ local function buildFrame(model)
         end
         rows = matched
     end
-    local columns = width >= 420 and 2 or 1
-    local gap = columns > 1 and 12 or 0
+    local columns = contentWidth >= controlRow * 14 and 2 or 1
+    local gap = columns > 1 and 12 * entryScale or 0
 
     return {
         width = width,
@@ -673,7 +673,9 @@ local function buildFrame(model)
         canSearch = canSearch, searchOpen = searchOpen, searchTop = searchTop,
         bodyTop = bodyTop, bodyBottom = bodyBottom,
         bodyHeight = math.max(1, bodyBottom - bodyTop),
-        rowHeight = rowHeight,
+        entryHeight = controlRow * 1.5,
+        entryGap = entryGap,
+        entryScale = entryScale,
         columns = columns, gap = gap,
         rows = rows,
         count = #rows,
@@ -683,8 +685,8 @@ local function buildFrame(model)
         c = paletteCached(model),
         titleFont = controlSize * 16 / 28,
         metaFont = controlSize * 11 / 28,
-        rowTitleFont = compact and 11 or 13,
-        rowMetaFont = compact and 10 or 11,
+        rowTitleFont = 12 * entryScale,
+        rowMetaFont = 10 * entryScale,
     }
 end
 
@@ -993,13 +995,14 @@ local function drawRowAction(key, x, y, size, glyph, color,
         label, tooltip, value)
     local hovered = interaction.isHovered(key)
     local pressed = interaction.isPressed(key)
-    draw.rect(x, y, size, size, color, 6,
+    local radius = size * 6 / 22
+    draw.rect(x, y, size, size, color, radius,
         pressed and 0.20 or (hovered and 0.12 or 0))
-    drawGlyph(glyph, x + size / 2, y + size / 2, 15, color)
+    drawGlyph(glyph, x + size / 2, y + size / 2, size * 15 / 22, color)
     local region = {
         key = key,
         shape = { type = "roundedRect", x = x, y = y,
-            width = size, height = size, radius = 6 },
+            width = size, height = size, radius = radius },
         cursor = "hand",
         events = { click = { id = glyph == "copy" and "entry.copy"
             or "entry.delete", value = value } },
@@ -1030,34 +1033,38 @@ end
 
 local function drawRow(f, entry, x, width, y, now, zh, nowParts)
     local ink = f.c.ink
-    local height = f.rowHeight - 8
+    local height = f.entryHeight
+    local scale = f.entryScale
+    local radius = 10 * scale
+    -- Reserve text room on narrow cards by compressing horizontal chrome.
+    local insetScale = math.min(scale, width / (6 * 28))
     local key = "row." .. tostring(entry.id)
     local hovered = interaction.isHovered(key)
     local pressed = interaction.isPressed(key)
-    draw.rect(x, y, width, height, f.c.surface, ROW_RADIUS,
+    draw.rect(x, y, width, height, f.c.surface, radius,
         pressed and 0.22 or (hovered and 0.18 or 0.14))
     draw.strokeRect(x, y, width, height, entry.pinned and f.c.accent or ink,
-        ROW_RADIUS, entry.pinned and 1.2 or 1,
+        radius, (entry.pinned and 1.2 or 1) * scale,
         entry.pinned and 0.55 or (hovered and 0.22 or 0.16))
 
     local glyphKind = entry.kind
     local copyable = canCopyEntry(entry)
     if glyphKind == "text" then glyphKind = clipboard.kindOfEntry(entry) end
     local tint = foregroundColor(TYPE_COLORS[glyphKind] or TYPE_COLORS.text, f.c.light)
-    local tile = f.compact and 30 or 34
-    local tileX = x + (f.compact and 9 or 12)
+    local tile = 30 * insetScale
+    local tileX = x + 10 * insetScale
     local tileY = y + (height - tile) / 2
     if entry.kind ~= "image" or not drawImagePreview(entry, tileX, tileY, tile, tile) then
-        draw.rect(tileX, tileY, tile, tile, tint, 8, f.c.light and 0.075 or 0.09)
+        draw.rect(tileX, tileY, tile, tile, tint, 8 * insetScale, f.c.light and 0.075 or 0.09)
         drawGlyph(glyphKind, tileX + tile / 2, tileY + tile / 2,
             tile * 0.56, tint)
     end
 
-    local actionSize = f.compact and 20 or 22
-    local actionGap = 3
-    local actionsX = x + width - 9 - actionSize * 2 - actionGap
-    local textX = tileX + tile + (f.compact and 8 or 10)
-    local titleMax = math.max(0, actionsX - 8 - textX)
+    local actionSize = 22 * insetScale
+    local actionGap = 3 * insetScale
+    local actionsX = x + width - 10 * insetScale - actionSize * 2 - actionGap
+    local textX = tileX + tile + 10 * insetScale
+    local titleMax = math.max(0, actionsX - 8 * insetScale - textX)
     local titleText = rowTitleCached(entry, zh)
     local titleKey = tostring(f.rowTitleFont) .. "\1" .. tostring(titleMax)
     local titleCache = entry._titleFit
@@ -1082,22 +1089,13 @@ local function drawRow(f, entry, x, width, y, now, zh, nowParts)
         entry._metaFit = metaCache
     end
     if titleMax > 0 then
-        local code = glyphKind == "code"
         local titleLine = math.max(titleCache.metrics.height, f.rowTitleFont)
         local metaLine = math.max(metaCache.metrics.height, f.rowMetaFont)
-        local titleHeight = code and titleLine * 2 or titleLine
-        local textGap = 2
-        local textTop = y + (height - titleHeight - metaLine - textGap) / 2
-        if code then
-            draw.pushClip(textX, textTop, titleMax, titleHeight)
-            draw.text(textX, textTop, entry.text, f.rowTitleFont, ink, titleMax,
-                false, false, titleHeight, 0.96)
-            draw.popClip()
-        else
-            drawAlignedText(textX, textTop + titleLine / 2, titleCache.value, f.rowTitleFont,
-                ink, titleMax, false, 0.96, CENTER_Y, titleCache.metrics)
-        end
-        local metaY = textTop + titleHeight + textGap + metaLine / 2
+        local textGap = 2 * scale
+        local textTop = y + (height - titleLine - metaLine - textGap) / 2
+        drawAlignedText(textX, textTop + titleLine / 2, titleCache.value, f.rowTitleFont,
+            ink, titleMax, false, 0.96, CENTER_Y, titleCache.metrics)
+        local metaY = textTop + titleLine + textGap + metaLine / 2
         drawAlignedText(textX, metaY, metaCache.value, f.rowMetaFont,
             f.c.muted, titleMax, false, nil, CENTER_Y, metaCache.metrics)
     end
@@ -1113,14 +1111,14 @@ local function drawRow(f, entry, x, width, y, now, zh, nowParts)
                 or "lua_widget.clipboard.menu_copy_hint"), entry.id)
     elseif entry.pinned then
         drawGlyph("pin", actionsX + actionSize / 2, actionY + actionSize / 2,
-            14, f.c.accent)
+            actionSize * 14 / 22, f.c.accent)
     end
     drawRowAction("delete." .. entry.id, actionsX + actionSize + actionGap,
         actionY, actionSize, "delete", f.c.muted,
         l10n.tr("lua_widget.clipboard.menu_delete"),
         l10n.tr("lua_widget.clipboard.menu_delete_hint"), entry.id)
     if entry.pinned and copyable then
-        drawGlyph("pin", x + 6, y + 7, 9, f.c.accent)
+        drawGlyph("pin", x + 6 * insetScale, y + 7 * scale, 9 * insetScale, f.c.accent)
     end
 
     local regionTop = math.max(y, f.bodyTop)
@@ -1132,7 +1130,7 @@ local function drawRow(f, entry, x, width, y, now, zh, nowParts)
             key = key,
             shape = { type = "roundedRect", x = x, y = regionTop,
                 width = math.max(1, actionsX - x), height = regionBottom - regionTop,
-                radius = ROW_RADIUS },
+                radius = radius },
             cursor = previewable and "hand" or "default",
             dragImage = IMAGE_DRAG and entry.kind == "image" and copyable and entry.image or nil,
             events = {
@@ -1289,19 +1287,22 @@ local function render(_context, model)
         drawEmpty(f, model)
     else
         local rowsPerColumn = math.ceil(f.count / f.columns)
-        local contentHeight = math.floor(math.max(f.bodyHeight,
-            rowsPerColumn * f.rowHeight))
+        local rowPitch = f.entryHeight + f.entryGap
+        local listHeight = rowsPerColumn * rowPitch - f.entryGap
+        -- The host rounds the viewport to the nearest unit. Passing a rounded-up
+        -- viewport as content can create a one-unit range even when the cards fit.
+        local contentHeight = listHeight > f.bodyHeight and math.ceil(listHeight) or 0
         local scrollRight = f.width - math.max(2, layout.cu(2))
         local scrollbarGutter = math.max(0,
             math.max(14, layout.cu(15)) - (scrollRight - f.right))
-        local listRight = f.right - (contentHeight > f.bodyHeight and scrollbarGutter or 0)
-        local cellWidth = (listRight - f.left - f.gap * (f.columns - 1)) / f.columns
         local scroll = interaction.scroll({
             key = "history",
             shape = { type = "rect", x = f.left, y = f.bodyTop,
                 width = scrollRight - f.left, height = f.bodyHeight },
             contentHeight = contentHeight,
         })
+        local listRight = f.right - (scroll and scroll.maximum > 0 and scrollbarGutter or 0)
+        local cellWidth = (listRight - f.left - f.gap * (f.columns - 1)) / f.columns
         local offset = scroll and scroll.offset or 0
         local now = time.now()
         local nowParts = time.parts(now)
@@ -1313,8 +1314,8 @@ local function render(_context, model)
             local column = (index - 1) % f.columns
             local rowIndex = math.floor((index - 1) / f.columns)
             local cellX = f.left + column * (cellWidth + f.gap)
-            local y = f.bodyTop - offset + rowIndex * f.rowHeight
-            if y + f.rowHeight > f.bodyTop - 1 and y < f.bodyBottom + 1 then
+            local y = f.bodyTop - offset + rowIndex * rowPitch
+            if y + f.entryHeight > f.bodyTop - 1 and y < f.bodyBottom + 1 then
                 drawRow(f, f.rows[index], cellX, cellWidth, y, now, zh, nowParts)
             end
         end
