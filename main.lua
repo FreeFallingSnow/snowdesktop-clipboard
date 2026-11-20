@@ -19,6 +19,9 @@ local MAX_STORED_TEXT = clipboard.MAX_STORED_TEXT
 local TOOLTIPS = widget.hasFeature("interaction.tooltip")
 local SEMANTIC_METADATA = widget.hasFeature("interaction.accessibility.metadata")
 local SEARCH_INPUT = widget.hasFeature("control.textInput")
+local PREVIEW_EDITOR = widget.hasFeature("view.surface.panel") and
+    widget.hasFeature("view.tree.core") and widget.hasFeature("view.inputControls")
+local PREVIEW_TEXT_MAX_BYTES = widget.hasFeature("view.textArea.largeValue") and MAX_TEXT or 4096
 local WATCH_IMAGE = widget.hasFeature("data.clipboard.changes.image")
 local IMAGE_DRAG = widget.hasFeature("interaction.dragImage")
 local FILE_PATHS = widget.hasFeature("clipboard.filePaths")
@@ -1311,10 +1314,29 @@ local function panel(_context, model)
     local entry = model.panelEntry or model.requestedPanelEntry
     if not entry then return end
     local padding = 14
+    local color = palette(widget.theme() or {})
+    if entry.kind == "text" and PREVIEW_EDITOR and #entry.text <= PREVIEW_TEXT_MAX_BYTES then
+        return view.box({
+            key = "preview.content",
+            width = "fill", height = "fill", padding = padding,
+            children = {
+                view.textArea({
+                    key = "preview.text.editor",
+                    width = "fill", height = "fill",
+                    value = model.panelDraft or entry.text,
+                    maxBytes = PREVIEW_TEXT_MAX_BYTES,
+                    liveUpdate = true,
+                    action = { id = "preview.text.change", value = entry.id },
+                    accessibility = { label = l10n.tr("lua_widget.clipboard.preview_title") },
+                    fontSize = 14,
+                    style = { foreground = color.ink, background = color.surface, cornerRadius = 8 },
+                }),
+            },
+        })
+    end
     local width = layout.contentWidth() - padding * 2
     local height = layout.contentHeight() - padding * 2
     if width < 24 or height < 24 then return end
-    local color = palette(widget.theme() or {})
     if entry.kind == "image" then
         if not drawImagePreview(entry, padding, padding, width, height) then
             draw.text(padding, padding, l10n.tr("lua_widget.clipboard.toast_image_unavailable"),
@@ -1555,6 +1577,14 @@ local function handleAction(model, value)
             width = entry.kind == "image" and 640 or 520,
             height = entry.kind == "image" and 480 or 360,
         })
+    elseif id == "preview.text.change" then
+        local entry = model.panelEntry
+        if value.surface == "panel" and entry and entry.kind == "text" and
+            value.value == entry.id and type(value.text) == "string" and
+            #value.text <= PREVIEW_TEXT_MAX_BYTES then
+            model.panelDraft = value.text
+            widget.invalidate()
+        end
     elseif id == "entry.copy" or id:sub(1, 11) == "entry.copy:" then
         copyEntry(model, entryIdFrom(value))
     elseif id == "entry.pin" or id:sub(1, 10) == "entry.pin:" then
@@ -1706,9 +1736,11 @@ local function event(_context, model, value)
         if value.action == "opened" then
             model.panelEntry = model.requestedPanelEntry
             model.requestedPanelEntry = nil
+            model.panelDraft = nil
         elseif value.action == "closed" then
             model.panelEntry = nil
             model.panelTextEntry = nil
+            model.panelDraft = nil
         end
         return
     end

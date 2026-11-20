@@ -251,6 +251,10 @@
     "interaction.accessibility.metadata",
     "draw.textInkMetrics",
     "control.textInput",
+    "view.surface.panel",
+    "view.tree.core",
+    "view.inputControls",
+    "view.textArea.largeValue",
     "interaction.dragImage",
     "clipboard.filePaths",
     "draw.glyph"
