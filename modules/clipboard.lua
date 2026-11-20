@@ -223,6 +223,7 @@ function clipboard.enrichSession(list, id, entry)
             else
                 merged.names = entry.names or item.names
                 merged.items = entry.items or item.items
+                merged.pathRefs = entry.pathRefs or item.pathRefs
             end
             result[#result + 1] = merged
             found = true
