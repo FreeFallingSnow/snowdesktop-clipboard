@@ -1214,8 +1214,10 @@ local function drawSearchRow(f, model)
     local hovered = interaction.isHovered(key)
     draw.rect(closeX, y, closeWidth, height, ink, 7,
         hovered and 0.14 or 0)
-    drawGlyph("close", closeX + closeWidth / 2, cy,
-        math.min(f.controlSize * 16 / 28, closeWidth - 2), f.c.muted)
+    local iconSize = math.min(f.controlSize * 16 / 28, closeWidth - 2)
+    -- The visible Dismiss strokes sit right and high in the Fluent font layout.
+    drawGlyph("close", closeX + closeWidth / 2 - (1 + iconSize * 0.06),
+        cy + iconSize * 0.10, iconSize, f.c.muted)
     interaction.region({
         key = key,
         shape = { type = "roundedRect", x = closeX, y = y,
@@ -1263,8 +1265,9 @@ local function render(_context, model)
         local rowsPerColumn = math.ceil(f.count / f.columns)
         local contentHeight = math.floor(math.max(f.bodyHeight,
             rowsPerColumn * f.rowHeight))
-        local scrollRight = f.width - 2
-        local scrollbarGutter = math.max(0, 14 - (scrollRight - f.right))
+        local scrollRight = f.width - math.max(2, layout.cu(2))
+        local scrollbarGutter = math.max(0,
+            math.max(14, layout.cu(15)) - (scrollRight - f.right))
         local listRight = f.right - (contentHeight > f.bodyHeight and scrollbarGutter or 0)
         local cellWidth = (listRight - f.left - f.gap * (f.columns - 1)) / f.columns
         local scroll = interaction.scroll({
