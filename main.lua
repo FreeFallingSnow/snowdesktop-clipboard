@@ -16,6 +16,7 @@ local CONFIRM_MS = 3000
 local MAX_TEXT = clipboard.MAX_TEXT
 local MAX_STORED_TEXT = clipboard.MAX_STORED_TEXT
 local TOOLTIPS = widget.hasFeature("interaction.tooltip")
+local EDGE_FADE = widget.hasFeature("draw.clip.edgeFade")
 local SEMANTIC_METADATA = widget.hasFeature("interaction.accessibility.metadata")
 local SEARCH_INPUT = widget.hasFeature("control.textInput")
 local PREVIEW_EDITOR = widget.hasFeature("view.surface.panel") and
@@ -1309,7 +1310,8 @@ local function render(_context, model)
         local zh = isZh()
 
         draw.pushClip(f.left - 2, f.bodyTop, listRight - f.left + 4,
-            f.bodyHeight)
+            f.bodyHeight, EDGE_FADE and scroll
+                and { scroll = scroll, fadeLength = f.controlRow * 0.5 } or nil)
         for index = 1, #f.rows do
             local column = (index - 1) % f.columns
             local rowIndex = math.floor((index - 1) / f.columns)

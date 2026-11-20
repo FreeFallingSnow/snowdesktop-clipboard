@@ -246,6 +246,7 @@
     "widget.panel"
   ],
   "optionalFeatures": [
+    "draw.clip.edgeFade",
     "data.clipboard.changes.image",
     "clipboard.imageIdentity",
     "interaction.accessibility.metadata",
