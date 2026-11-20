@@ -22,6 +22,7 @@ local SEARCH_INPUT = widget.hasFeature("control.textInput")
 local WATCH_IMAGE = widget.hasFeature("data.clipboard.changes.image")
 local IMAGE_DRAG = widget.hasFeature("interaction.dragImage")
 local FILE_PATHS = widget.hasFeature("clipboard.filePaths")
+local CENTER_GLYPH = widget.hasFeature("draw.glyph")
 local HEADER_BG_HOVER = 0.10
 local HEADER_BG_ACTIVE = 0.16
 
@@ -706,7 +707,11 @@ local GLYPHS = {
 }
 
 local function drawGlyph(kind, cx, cy, size, color)
-    draw.fluent(GLYPHS[kind], cx - size / 2, cy - size / 2, size, color)
+    if CENTER_GLYPH then
+        draw.glyph(GLYPHS[kind], cx, cy, size, color, "fluent")
+    else
+        draw.fluent(GLYPHS[kind], cx - size / 2, cy - size / 2, size, color)
+    end
 end
 
 local function centeredTextY(metrics, cy)
@@ -1215,9 +1220,13 @@ local function drawSearchRow(f, model)
     draw.rect(closeX, y, closeWidth, height, ink, 7,
         hovered and 0.14 or 0)
     local iconSize = math.min(f.controlSize * 16 / 28, closeWidth - 2)
-    -- The visible Dismiss strokes sit right and high in the Fluent font layout.
-    drawGlyph("close", closeX + closeWidth / 2 - (1 + iconSize * 0.06),
-        cy + iconSize * 0.10, iconSize, f.c.muted)
+    local cx = closeX + closeWidth / 2
+    if not CENTER_GLYPH then
+        -- Older hosts position this glyph using font layout metrics.
+        cx = cx - (1 + iconSize * 0.06)
+        cy = cy + iconSize * 0.10
+    end
+    drawGlyph("close", cx, cy, iconSize, f.c.muted)
     interaction.region({
         key = key,
         shape = { type = "roundedRect", x = closeX, y = y,

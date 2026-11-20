@@ -252,7 +252,8 @@
     "draw.textInkMetrics",
     "control.textInput",
     "interaction.dragImage",
-    "clipboard.filePaths"
+    "clipboard.filePaths",
+    "draw.glyph"
   ],
   "networkDomains": [],
   "permissions": [
