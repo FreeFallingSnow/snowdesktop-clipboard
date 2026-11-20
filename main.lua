@@ -1331,7 +1331,7 @@ local function panel(_context, model)
     local scroll = interaction.scroll({
         key = "preview.text",
         shape = { type = "rect", x = padding, y = padding, width = width, height = height },
-        contentHeight = math.max(height, model.panelTextHeight),
+        contentHeight = math.min(1000000, math.max(math.ceil(height), model.panelTextHeight)),
     })
     draw.pushClip(padding, padding, textWidth, height)
     draw.text(padding, padding - scroll.offset, entry.text, 14, color.ink,
