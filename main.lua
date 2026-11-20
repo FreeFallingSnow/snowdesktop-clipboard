@@ -717,11 +717,26 @@ local function drawGlyph(kind, cx, cy, size, color)
     end
 end
 
-local function centeredTextY(metrics, cy)
-    if metrics.ink and metrics.ink.height > 0 then
-        return cy - metrics.ink.top - metrics.ink.height / 2
+local INK_TEXT = widget.hasFeature("draw.text.inkAlignment")
+local CENTER_Y = { y = "center" }
+local CENTER_TEXT = { x = "center", y = "center" }
+local LEFT_TEXT = { x = "start", y = "center" }
+
+local function drawAlignedText(x, y, text, font, color, width, bold, alpha, anchors, metrics)
+    if not INK_TEXT then
+        metrics = metrics or draw.measureText(text, font, 0, bold)
+        local ink = metrics.ink
+        y = (ink and ink.height > 0) and (y - ink.top - ink.height / 2)
+            or (y - metrics.height / 2)
+        if anchors.x == "center" then
+            x = (ink and ink.width > 0) and (x - ink.left - ink.width / 2)
+                or (x - metrics.width / 2)
+        elseif anchors.x == "start" and ink then
+            x = x - ink.left
+        end
     end
-    return cy - metrics.height / 2
+    draw.text(x, y, text, font, color, width, bold, true, 0, alpha,
+        nil, INK_TEXT and anchors or nil)
 end
 
 -- Header -------------------------------------------------------------------
@@ -750,9 +765,8 @@ local function drawHeader(f, model)
     local titleRoom = (searchX or clearX) - (showWarning and 20 or 5) - f.left
     local title = headerTitle(model, f.titleFont, titleRoom)
     if title.text ~= "" then
-        local titleX = f.left - (title.metrics.ink and title.metrics.ink.left or 0)
-        draw.text(titleX, centeredTextY(title.metrics, cy), title.text,
-            f.titleFont, ink, titleRoom, true, true, 0, 0.97)
+        drawAlignedText(f.left, cy, title.text, f.titleFont, ink, titleRoom,
+            true, 0.97, LEFT_TEXT, title.metrics)
         interaction.region({
             key = "header.title",
             shape = { type = "rect", x = f.left, y = f.top,
@@ -861,13 +875,13 @@ local function drawFilters(f)
         elseif hovered then
             draw.rect(x + 2, y + 2, tabWidth - 4, height - 4, ink, 7, 0.055)
         end
-        -- Align the visible shapes with the center of the label ink.
-        local glyphY = cy + (key == "all" and glyphSize * 0.13 or glyphSize * 0.07)
+        local glyphY = CENTER_GLYPH and cy
+            or (cy + (key == "all" and glyphSize * 0.13 or glyphSize * 0.07))
         drawGlyph(key, gx, glyphY, glyphSize, selected and f.c.accent or f.c.muted)
         if wide then
-            draw.text(gx + glyphSize / 2 + 4, centeredTextY(metrics, cy),
+            drawAlignedText(gx + glyphSize / 2 + 4, cy,
                 label, font, selected and f.c.accent or f.c.muted,
-                0, selected, true)
+                0, selected, nil, CENTER_Y, metrics)
         end
         local region = {
             key = regionKey,
@@ -1080,12 +1094,12 @@ local function drawRow(f, entry, x, width, y, now, zh, nowParts)
                 false, false, titleHeight, 0.96)
             draw.popClip()
         else
-            draw.text(textX, centeredTextY(titleCache.metrics, textTop + titleLine / 2),
-                titleCache.value, f.rowTitleFont, ink, titleMax, false, true, 0, 0.96)
+            drawAlignedText(textX, textTop + titleLine / 2, titleCache.value, f.rowTitleFont,
+                ink, titleMax, false, 0.96, CENTER_Y, titleCache.metrics)
         end
         local metaY = textTop + titleHeight + textGap + metaLine / 2
-        draw.text(textX, centeredTextY(metaCache.metrics, metaY),
-            metaCache.value, f.rowMetaFont, f.c.muted, titleMax, false, true)
+        drawAlignedText(textX, metaY, metaCache.value, f.rowMetaFont,
+            f.c.muted, titleMax, false, nil, CENTER_Y, metaCache.metrics)
     end
 
     local actionY = y + (height - actionSize) / 2
@@ -1155,8 +1169,8 @@ local function drawEmpty(f, model)
         + math.max(iconSize, metrics.height) / 2
     drawGlyph(searching and "search" or "clipboard",
         x + iconSize / 2, centerY, iconSize, f.c.muted)
-    draw.text(x + iconSize + gap, centeredTextY(metrics, centerY), title,
-        font, f.c.ink, 0, false, true, 0, 0.78)
+    drawAlignedText(x + iconSize + gap, centerY, title,
+        font, f.c.ink, 0, false, 0.78, CENTER_Y, metrics)
     if not showAction then return end
 
     local actionKey = filter == "image" and "lua_widget.clipboard.menu_capture_image"
@@ -1171,9 +1185,8 @@ local function drawEmpty(f, model)
     local buttonX = cx - buttonWidth / 2
     local buttonY = centerY + math.max(iconSize, metrics.height) / 2 + 9
     draw.rect(buttonX, buttonY, buttonWidth, buttonHeight, f.c.accent, 7, 0.92)
-    draw.text(cx - labelMetrics.width / 2,
-        centeredTextY(labelMetrics, buttonY + buttonHeight / 2),
-        label, buttonFont, f.c.accentInk, 0, true, true, 0, 0.98)
+    drawAlignedText(cx, buttonY + buttonHeight / 2, label, buttonFont,
+        f.c.accentInk, 0, true, 0.98, CENTER_TEXT, labelMetrics)
     interaction.region({
         key = "empty.capture",
         shape = { type = "roundedRect", x = buttonX, y = buttonY,
@@ -1251,15 +1264,16 @@ local function drawToast(f, model)
     local font = f.metaFont
     local maxWidth = f.right - f.left
     local text = ellipsize(model.toast.text, font, maxWidth - 24, false)
-    local width = math.min(maxWidth, textWidth(text, font, false) + 24)
+    local metrics = draw.measureText(text, font, 0, false)
+    local width = math.min(maxWidth, metrics.width + 24)
     local height = 30
     local x = f.left + (maxWidth - width) / 2
     local y = f.bodyBottom - height - 8
     local background = f.c.light and 0xFFFFFF or 0x252936
     draw.rect(x, y, width, height, background, 10, 0.98)
     draw.strokeRect(x, y, width, height, f.c.ink, 10, 1, 0.10)
-    draw.text(x + 12, y + (height - font) / 2, text, font,
-        f.c.ink, 0, false, true, 0, 0.94)
+    drawAlignedText(x + width / 2, y + height / 2, text, font,
+        f.c.ink, 0, false, 0.94, CENTER_TEXT, metrics)
 end
 
 local function render(_context, model)

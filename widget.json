@@ -250,6 +250,7 @@
     "clipboard.imageIdentity",
     "interaction.accessibility.metadata",
     "draw.textInkMetrics",
+    "draw.text.inkAlignment",
     "control.textInput",
     "view.surface.panel",
     "view.tree.core",
